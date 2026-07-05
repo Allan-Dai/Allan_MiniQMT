@@ -1,0 +1,96 @@
+# Python 字节码和缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 敏感配置文件（包含账户信息和QMT路径）
+account_config.json
+
+# 数据库文件
+data/trading.db
+*.db
+
+# 日志文件
+logs/
+*.log
+*.log.*
+
+# 调试日志
+xtquant_debug.log
+xtquant_market_data_debug.log
+test_trading_executor.log
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git Worktrees
+.worktrees/
+
+# Claude Code 索引
+.claude/index.json
+.claude/
+
+
+# Spec Workflow 配置和模板
+.spec-workflow/
+
+# 临时文件
+*.tmp
+*.bak
+*.orig
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# Python 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# 测试文件和临时数据
+test_*.py.bak
+data/stock2buy.json.bak
+
+# 注意：account_config.json.example 应该被跟踪，作为配置模板
+!account_config.json.example
+
+# 运行时数据文件
+stock_pool.json
+data/
+logs/
+
+# 临时测试报告(根目录)
+/*_REPORT.md
+/*_TEST_REPORT.md
+/test_*.py
+
+# 中间过程的临时文档(不纳入版本管理)
+docs/*
+!docs/plans/
+!docs/xtquant_manager.md
+
+# 注意：test/ 目录已改为跟踪，包含正式的回归测试套件
+# 如需忽略test目录下的临时文件，请使用具体规则，如：
+# test/*.tmp
+# test/reports/*.json (测试报告除外)
+
+
+__pycache__/config.cpython-38.pyc
+__pycache__/data_manager.cpython-38.pyc
+__pycache__/data_manager.cpython-310.pyc
+__pycache__/logger.cpython-38.pyc
+__pycache__/logger.cpython-310.pyc
+__pycache__/position_manager.cpython-38.pyc
+__pycache__/position_manager.cpython-310.pyc
+xtquant/__pycache__/xtconn.cpython-38.pyc
+xtquant/__pycache__/xtdatacenter.cpython-38.pyc
+xtquant/__pycache__/xtutil.cpython-38.pyc
+.omc/
+.env.example

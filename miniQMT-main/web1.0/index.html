@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>交易监控面板</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 基础样式 */
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        }
+
+        .main-container {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 40px);
+            min-height: 768px;
+        }
+
+        .content-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        @keyframes fadeOut {
+            from { opacity: 1; }
+            to { opacity: 0; }
+        }
+
+        .fade-out {
+            animation: fadeOut 0.3s ease-out forwards;
+        }
+
+        /* 优化刷新状态指示器 */
+        #refreshStatus {
+            animation: fadeOut 0.5s ease-in-out;
+            z-index: 1000;
+        }
+
+        /* 优化数据更新指示器 */
+        .highlight-update {
+            animation: highlight 1s ease-out;
+        }
+
+        @keyframes highlight {
+            0% { background-color: rgba(16, 185, 129, 0.2); }
+            100% { background-color: transparent; }
+        }
+        
+        #orderLog {
+            height: 400px;
+            min-height: 400px;
+            max-height: 400px;
+            overflow-y: scroll;
+            overflow-y: overlay;
+            white-space: pre-wrap;
+            overflow-wrap: break-word;
+        }
+
+        #orderLog::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        /* 状态消息样式 */
+        .status-message {
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .loading { background-color: #e0f2fe; color: #0c4a6e; border: 1px solid #7dd3fc;}
+        .error { background-color: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+        .success { background-color: #dcfce7; color: #166534; border: 1px solid #86efac; }
+        .warning { background-color: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+        
+        /* API连接状态指示器 */
+        .connection-status {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-weight: bold;
+            z-index: 1000;
+        }
+        .connected { background-color: #dcfce7; color: #166534; }
+        .disconnected { background-color: #fee2e2; color: #991b1b; }
+        
+        /* 刷新状态动画 */
+        @keyframes fadeOut {
+            from { opacity: 1; }
+            to { opacity: 0; }
+        }
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            50% { opacity: 0.3; }
+            100% { opacity: 0.6; }
+        }
+
+        /* 加载图标淡入淡出 */
+        #holdingsLoading, #logLoading {
+            transition: opacity 0.3s ease;
+        }
+
+        #holdingsLoading.shown, #logLoading.shown {
+            opacity: 1;
+        }
+
+        #holdingsLoading:not(.shown), #logLoading:not(.shown) {
+            opacity: 0;
+            transition-delay: 0.3s;
+        }
+
+        .api-refreshing .text-blue-700 {
+            position: relative;
+        }
+
+        .api-refreshing .text-blue-700::after {
+            content: '';
+            position: absolute;
+            bottom: -3px;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: linear-gradient(90deg, rgba(59, 130, 246, 0.5), rgba(96, 165, 250, 0.1));
+            animation: pulse 2s infinite;
+        }
+
+        .refreshing {
+            position: relative;
+        }
+
+        .refreshing::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            left: 0;
+            background-color: rgba(255, 255, 255, 0.1);
+            pointer-events: none;
+            animation: pulse 1s infinite;
+            z-index: 5;
+        }
+        
+        /* 低性能模式 */
+        .low-performance-mode .refreshing::after {
+            animation: none;
+            opacity: 0.1;
+        }
+        
+        /* 参数验证错误提示 */
+        .param-error {
+            color: #ef4444;
+            font-size: 0.75rem;
+            margin-top: 0.25rem;
+        }
+        
+        /* 模拟交易模式警告 */
+        .simulation-mode-warning {
+            background-color: #fef3c7;
+            border: 1px solid #f59e0b;
+            color: #92400e;
+            padding: 0.5rem;
+            border-radius: 0.25rem;
+            margin-bottom: 0.5rem;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+        }
+        
+        .simulation-mode-warning svg {
+            margin-right: 0.5rem;
+        }
+
+        /* 风险等级选择器样式 */
+        .risk-level-selector {
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          padding: 15px;
+          border-radius: 8px;
+          color: white;
+          margin-bottom: 20px;
+        }
+
+        .risk-level-selector label {
+          color: white !important;
+          margin-bottom: 8px;
+          display: block;
+        }
+
+        .risk-select {
+          width: 100%;
+          padding: 10px;
+          font-size: 14px;
+          border: 2px solid #ddd;
+          border-radius: 6px;
+          background: white;
+          color: #333;
+          cursor: pointer;
+          transition: all 0.3s;
+        }
+
+        .risk-select:hover {
+          border-color: #667eea;
+          box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+        }
+
+        .risk-select:focus {
+          outline: none;
+          border-color: #667eea;
+          box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+        }
+
+        .risk-description {
+          margin-top: 10px;
+          padding: 10px;
+          background: rgba(255,255,255,0.2);
+          border-radius: 4px;
+          font-size: 13px;
+          line-height: 1.5;
+          backdrop-filter: blur(10px);
+        }
+
+        .tooltip-icon {
+          cursor: help;
+          margin-left: 5px;
+          font-size: 16px;
+          position: relative;
+          display: inline-block;
+        }
+
+        .tooltip-icon:hover::after {
+          content: attr(data-tooltip);
+          position: absolute;
+          bottom: 125%;
+          left: 50%;
+          transform: translateX(-50%);
+          padding: 8px 12px;
+          background: rgba(0,0,0,0.9);
+          color: white;
+          font-size: 12px;
+          white-space: nowrap;
+          border-radius: 4px;
+          z-index: 1000;
+          pointer-events: none;
+        }
+
+        .tooltip-icon:hover::before {
+          content: "";
+          position: absolute;
+          bottom: 115%;
+          left: 50%;
+          transform: translateX(-50%);
+          border: 5px solid transparent;
+          border-top-color: rgba(0,0,0,0.9);
+          z-index: 1000;
+        }
+
+        /* 视觉反馈动画 */
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.02); }
+        }
+
+        .risk-level-selector.pulsing {
+          animation: pulse 0.5s;
+        }
+
+        /* 网格状态Tooltip */
+        .grid-tooltip {
+          display: none;
+          position: absolute;
+          background: white;
+          border: 2px solid #667eea;
+          border-radius: 8px;
+          padding: 12px;
+          box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+          z-index: 9999;
+          min-width: 280px;
+          max-width: 350px;
+          pointer-events: none;
+          font-size: 13px;
+        }
+
+        .tooltip-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 10px;
+          padding-bottom: 8px;
+          border-bottom: 1px solid #e0e0e0;
+        }
+
+        .tooltip-stock-code {
+          font-weight: bold;
+          font-size: 14px;
+          color: #333;
+        }
+
+        .tooltip-risk-badge {
+          font-size: 11px;
+          padding: 3px 10px;
+          border-radius: 12px;
+          color: white;
+          font-weight: bold;
+        }
+
+        .tooltip-risk-badge.aggressive {
+          background: linear-gradient(135deg, #ff6b6b, #ee5a6f);
+        }
+
+        .tooltip-risk-badge.moderate {
+          background: linear-gradient(135deg, #4ecdc4, #44a3a3);
+        }
+
+        .tooltip-risk-badge.conservative {
+          background: linear-gradient(135deg, #95e1d3, #7fccc4);
+          color: #333;
+        }
+
+        .tooltip-body {
+          margin-bottom: 10px;
+        }
+
+        .tooltip-row {
+          display: flex;
+          justify-content: space-between;
+          margin: 6px 0;
+          padding: 4px 0;
+        }
+
+        .tooltip-label {
+          color: #666;
+        }
+
+        .tooltip-value {
+          font-weight: bold;
+          color: #333;
+        }
+
+        .tooltip-value.profit {
+          color: #2ecc71;
+        }
+
+        .tooltip-value.loss {
+          color: #e74c3c;
+        }
+
+        .tooltip-value.warning {
+          color: #f39c12;
+        }
+
+        .tooltip-footer {
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px solid #e0e0e0;
+          text-align: center;
+          font-size: 11px;
+          color: #667eea;
+        }
+
+        /* Tooltip箭头 */
+        .grid-tooltip::before {
+          content: "";
+          position: absolute;
+          top: -8px;
+          left: 20px;
+          border: 8px solid transparent;
+          border-bottom-color: #667eea;
+        }
+
+        .grid-tooltip::after {
+          content: "";
+          position: absolute;
+          top: -6px;
+          left: 22px;
+          border: 6px solid transparent;
+          border-bottom-color: white;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 p-4">
+    <div id="connectionStatus" class="connection-status disconnected">API未连接</div>
+    <div class="container mx-auto bg-white shadow-md rounded-lg p-5">
+
+        <div id="messageArea"></div>
+        
+        <!-- 模拟交易模式警告 -->
+        <div id="simulationModeWarning" class="simulation-mode-warning hidden">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd" />
+            </svg>
+            <span>当前为模拟交易模式，所有买卖操作不会真实执行</span>
+        </div>
+
+        <section class="mb-6 border rounded p-4 bg-gray-50">
+            <h2 class="text-xl font-semibold mb-3 text-blue-700">1. 参数设置</h2>
+            <div class="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 items-center">
+                <div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="singleBuyAmount" class="text-sm whitespace-nowrap">单只单次买入金额:</label>
+                        <input type="number" id="singleBuyAmount" class="border rounded px-2 py-1 w-full" value="35000">
+                    </div>
+                    <div id="singleBuyAmountError" class="param-error hidden"></div>
+                </div>
+                 <div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="firstProfitSell" class="text-sm whitespace-nowrap">平仓盈利超过:</label>
+                        <input type="number" id="firstProfitSell" class="border rounded px-2 py-1 w-20" value="5.00" step="0.1" min="0">
+                        <input type="checkbox" id="firstProfitSellEnabled" class="form-checkbox h-5 w-5 text-blue-600" checked>
+                        <label for="firstProfitSellEnabled" class="text-sm">%</label>
+                    </div>
+                    <div id="firstProfitSellError" class="param-error hidden"></div>
+                 </div>
+                 <div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="stockGainSellPencent" class="text-sm whitespace-nowrap">首次盈利平仓卖出:</label>
+                        <input type="number" id="stockGainSellPencent" class="border rounded px-2 py-1 w-20" value="60.00">
+                        <input type="checkbox" id="firstProfitSellPencent" class="form-checkbox h-5 w-5 accent-gray-600" checked>
+                        <label for="firstProfitSellPencent" class="text-sm">%</label>
+                    </div>
+                    <div id="stockGainSellPencentError" class="param-error hidden"></div>
+                </div>
+                 <div class="flex items-center space-x-2">
+                    <input type="checkbox" id="allowBuy" class="form-checkbox h-5 w-5 text-blue-600" checked>
+                    <label for="allowBuy" class="text-sm">允许买</label>
+                    <input type="checkbox" id="allowSell" class="form-checkbox h-5 w-5 text-blue-600" checked>
+                    <label for="allowSell" class="text-sm">允许卖</label>
+                 </div>				
+				<div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="stopLossBuy" class="text-sm whitespace-nowrap">补仓跌幅超过:</label>
+                        <input type="number" id="stopLossBuy" class="border rounded px-2 py-1 w-20" value="5.00" step="0.1" min="0">
+                        <input type="checkbox" id="stopLossBuyEnabled" class="form-checkbox h-5 w-5 text-blue-600" checked>
+                        <label for="stopLossBuyEnabled" class="text-sm">%</label>
+                    </div>
+                    <div id="stopLossBuyError" class="param-error hidden"></div>
+                </div>				
+                <div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="stockStopLoss" class="text-sm whitespace-nowrap">平仓止损超过:</label>
+                        <input type="number" id="stockStopLoss" class="border rounded px-2 py-1 w-20" value="7.00" step="0.1" min="0">
+                        <input type="checkbox" id="StopLossEnabled" class="form-checkbox h-5 w-5 accent-gray-600" checked>
+                        <label for="StopLossEnabled" class="text-sm">%</label>
+                    </div>
+                    <div id="stockStopLossError" class="param-error hidden"></div>
+                </div>
+				<div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="singleStockMaxPosition" class="text-sm whitespace-nowrap">单只股票最大持仓:</label>
+                        <input type="number" id="singleStockMaxPosition" class="border rounded px-2 py-1 w-full" value="70000">
+                    </div>
+                    <div id="singleStockMaxPositionError" class="param-error hidden"></div>
+                </div>
+                <div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="totalMaxPosition" class="text-sm whitespace-nowrap">最大总持仓:</label>
+                        <input type="number" id="totalMaxPosition" class="border rounded px-2 py-1 w-full" value="400000">
+                    </div>
+                    <div id="totalMaxPositionError" class="param-error hidden"></div>
+                </div>
+				<div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="totalAccounts" class="text-sm whitespace-nowrap">连接IP:</label>
+                        <input type="text" id="totalAccounts" class="border rounded px-2 py-1 w-full" value="127.0.0.1">
+                    </div>
+                </div>
+                <div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="connectPort" class="text-sm whitespace-nowrap">端口号:</label>
+                        <input type="number" id="connectPort" class="border rounded px-2 py-1 w-full" value="5000">
+                    </div>
+                    <div id="connectPortError" class="param-error hidden"></div>
+                </div>
+                <div class="flex flex-col">
+                    <div class="flex items-center space-x-2">
+                        <label for="apiToken" class="text-sm whitespace-nowrap">API Token:</label>
+                        <input type="password" id="apiToken" class="border rounded px-2 py-1 w-full" placeholder="留空则不验证">
+                    </div>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <input type="checkbox" id="simulationMode" class="form-checkbox h-8 w-8 text-orange-600">
+                    <label for="simulationMode" class="text-sm font-bold text-orange-600">模拟交易模式</label>
+                    <input type="checkbox" id="globalAllowBuySell" class="form-checkbox h-8 w-8 text-blue-600 ml-auto" checked>
+                    <label for="globalAllowBuySell" class="text-base font-bold">全局监控总开关</label>
+                </div>
+
+            </div>
+
+            <div class="mt-4 flex justify-between items-center">
+                 <div id="accountInfo" class="text-sm text-gray-700">
+                    账号 <span id="accountId" class="font-bold">--</span>:
+                    可用金额: <span id="availableBalance" class="font-bold text-green-600">--</span>
+                    最高持股: <span id="maxHoldingValue" class="font-bold">--</span>
+                    总资产: <span id="totalAssets" class="font-bold">--</span>
+                    数据更新时间: <span id="last-update-timestamp">--</span>
+                 </div>
+                <div id="statusIndicator" class="text-lg font-bold text-red-600">
+                    未运行
+                </div>
+            </div>
+
+             <div class="mt-4 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2">
+                <button id="toggleMonitorBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out">
+                    开始执行监控
+                </button>
+                <button id="saveConfigBtn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out">
+                    保存当前数据
+                </button>
+                 <button id="clearLogBtn" class="bg-yellow-500 hover:bg-yellow-600 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out">
+                    清空日志
+                 </button>
+                 <button id="clearCurrentDataBtn" class="bg-orange-500 hover:bg-orange-600 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out">
+                    清空当前数据
+                 </button>
+                 <button id="clearBuySellDataBtn" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out">
+                    ⚠️ 清空买入/卖出数据
+                 </button>
+                 <button id="importDataBtn" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out">
+                    导入保存数据
+                 </button>
+                 <button id="initHoldingsBtn" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out">
+                    初始化持仓数据
+                 </button>
+            </div>
+        </section>
+
+        <section class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div class="lg:col-span-2 flex flex-col space-y-4">
+                <div class="flex items-center space-x-2 border rounded p-3 bg-gray-50">
+                    <label for="buyStrategy" class="text-sm font-medium whitespace-nowrap">1. 选股买入设置:</label>
+                    <select id="buyStrategy" class="border rounded px-2 py-1 text-sm">
+                        <option value="random_pool">从备选池随机买入</option>
+                        <option value="custom_stock">自定义股票买入</option>
+                    </select>
+                    <input type="number" id="buyQuantity" class="border rounded px-2 py-1 w-20 text-sm" placeholder="数量" value="1">
+                    <label for="buyQuantity" class="text-sm">只</label>
+                    <button id="executeBuyBtn" class="bg-cyan-600 hover:bg-cyan-700 text-white text-sm font-bold py-1 px-3 rounded transition duration-150 ease-in-out whitespace-nowrap">
+                        一键买入
+                    </button>
+                </div>
+
+                <div class="flex-grow border rounded p-3 bg-white overflow-x-auto">
+                    <h3 class="text-lg font-semibold mb-2 text-blue-700 flex items-center">
+                        2. 当前持仓列表
+                        <span id="holdingsLoading" class="ml-2 text-xs text-gray-500 hidden">
+                            <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-blue-500 inline" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            更新中
+                        </span>
+                        <span id="holdingsError" class="ml-2 text-xs text-red-500 hidden">加载失败</span>
+                    </h3>
+                     <div class="overflow-y-auto max-h-96"> 
+                         <table class="w-full text-sm text-left border-collapse">
+                            <thead class="bg-gray-200 sticky top-0"> <tr>
+                                    <th class="border p-2"><input type="checkbox" id="selectAllHoldings"></th>
+                                    <th class="border p-2">代码</th>
+                                    <th class="border p-2">名称</th>
+                                    <th class="border p-2">涨跌幅</th>
+                                    <th class="border p-2">价格</th>
+                                    <th class="border p-2">成本价</th>
+                                    <th class="border p-2">盈亏率</th>
+                                    <th class="border p-2">市值</th>
+                                    <th class="border p-2">可用数</th>
+                                    <th class="border p-2">总数</th>
+                                    <th class="border p-2">已止盈</th>
+                                    <th class="border p-2">买后最高</th>
+                                    <th class="border p-2">动态止损</th>
+                                    <th class="border p-2">建仓时间</th>
+                                    <th class="border p-2">基准成本</th>
+                                </tr>
+                            </thead>
+                            <tbody id="holdingsTableBody">
+                                <!-- 持仓数据将在这里插入 -->
+                            </tbody>
+                        </table>
+                     </div>
+                </div>
+            </div>
+
+            <div class="border rounded p-3 bg-gray-50 flex flex-col relative" style="height: 460px;">
+                <h3 class="text-lg font-semibold mb-2 text-blue-700 flex items-center">
+                    3. 下单日志
+                    <span id="logLoading" class="ml-2 text-xs text-gray-500 hidden">
+                        <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-blue-500 inline" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        更新中
+                    </span>
+                    <span id="logError" class="ml-2 text-xs text-red-500 hidden">加载失败</span>
+                </h3>
+                <div class="flex-grow relative">
+                    <textarea id="orderLog" class="w-full h-full border rounded p-2 text-xs bg-white resize-none" readonly></textarea>
+                </div>
+            </div>
+        </section>
+
+    </div>
+
+    <div id="stockSelectDialog" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center hidden z-50">
+        <div class="bg-white rounded-lg p-6 w-96 max-w-lg">
+            <h3 id="dialogTitle" class="text-lg font-semibold mb-4">选择股票</h3>
+            <div id="dialogContent">
+                <!-- 动态内容会在JavaScript中插入 -->
+            </div>
+            <div class="flex justify-end mt-6 space-x-2">
+                <button id="dialogCancelBtn" class="px-4 py-2 bg-gray-300 rounded hover:bg-gray-400">取消</button>
+                <button id="dialogConfirmBtn" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 网格交易配置对话框 -->
+    <div id="gridConfigDialog" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center hidden z-50">
+        <div class="bg-white rounded-lg p-6 w-[600px] max-w-2xl relative">
+            <!-- Loading覆盖层 -->
+            <div id="gridConfigLoading" class="absolute inset-0 bg-white bg-opacity-90 rounded-lg flex flex-col items-center justify-center hidden z-10">
+                <div class="w-12 h-12 border-4 border-gray-200 border-t-blue-600 rounded-full animate-spin mb-4"></div>
+                <p class="text-gray-700 font-medium">正在加载配置...</p>
+            </div>
+
+            <h3 class="text-lg font-semibold mb-4">网格交易配置</h3>
+
+            <!-- ⚠️ 新增: 风险等级选择器 -->
+            <div class="form-group risk-level-selector">
+              <label for="riskLevel">
+                <strong>🎯 风险等级</strong>
+                <span class="tooltip-icon" data-tooltip="选择风险等级将自动填充推荐参数,您仍可手动微调">ℹ️</span>
+              </label>
+              <select id="riskLevel" class="risk-select" onchange="applyRiskTemplate()">
+                <option value="conservative">
+                  🛡️ 保守型 - 稳健低风险,快速止损(-8%)
+                </option>
+                <option value="moderate" selected>
+                  ⚖️ 稳健型 - 平衡收益,推荐策略(默认)
+                </option>
+                <option value="aggressive">
+                  🚀 激进型 - 高风险高收益,容忍大回撤(-15%)
+                </option>
+              </select>
+
+              <!-- 风险描述提示 -->
+              <div id="riskDescription" class="risk-description">
+                平衡风险收益,适合主流蓝筹股,默认推荐策略
+              </div>
+            </div>
+
+            <hr style="margin: 15px 0; border-color: #e0e0e0;">
+
+            <div class="mb-4">
+                <p class="text-sm text-gray-600">股票代码: <span id="gridStockCode" class="font-semibold"></span></p>
+
+                <!-- 价格参考信息 -->
+                <div class="bg-blue-50 border border-blue-200 rounded p-2 mb-3 space-y-1">
+                    <p class="text-sm text-gray-700">📊 <span class="font-medium">实时市场价</span>: <span id="gridCurrentPrice" class="font-semibold text-blue-700"></span></p>
+                    <p class="text-sm text-gray-700" id="gridExistingCenterPriceRow" style="display: none;">📌 <span class="font-medium">原网格中心价</span>: <span id="gridExistingCenterPrice" class="font-semibold text-green-700"></span> <span class="text-xs text-gray-500">(锁定)</span></p>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        网格中心价格 (元)
+                        <span class="text-gray-500 text-xs">可手动修改，默认使用实时市场价</span>
+                    </label>
+                    <input type="number" id="gridCenterPriceInput" step="0.01" min="0.01"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                           placeholder="请输入网格中心价格">
+                </div>
+            </div>
+
+
+            <div class="grid grid-cols-2 gap-4 mb-6">
+                <!-- 网格价格间隔 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        网格价格间隔 (%)
+                        <span class="text-gray-500 text-xs">每档价格差异</span>
+                    </label>
+                    <input type="number" id="gridPriceInterval" step="0.01" min="0.01" max="20"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <!-- 每档交易比例 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        每档交易比例 (%)
+                        <span class="text-gray-500 text-xs">单次交易占比</span>
+                    </label>
+                    <input type="number" id="gridPositionRatio" step="0.01" min="1" max="100"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <!-- 回调触发比例 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        回调触发比例 (%)
+                        <span class="text-gray-500 text-xs">确认回调幅度</span>
+                    </label>
+                    <input type="number" id="gridCallbackRatio" step="0.01" min="0.1" max="10"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <!-- 最大追加投入 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        最大追加投入 (元)
+                        <span class="text-gray-500 text-xs">网格总投入上限</span>
+                    </label>
+                    <input type="number" id="gridMaxInvestment" step="1000" min="0"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <!-- 运行时长限制 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        运行时长限制 (天)
+                        <span class="text-gray-500 text-xs">自动停止时间</span>
+                    </label>
+                    <input type="number" id="gridDurationDays" step="1" min="1" max="365"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <!-- 最大偏离度 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        最大偏离度 (%)
+                        <span class="text-gray-500 text-xs">中心价偏离上限</span>
+                    </label>
+                    <input type="number" id="gridMaxDeviation" step="1" min="5" max="50"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <!-- 目标盈利 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        目标盈利 (%)
+                        <span class="text-gray-500 text-xs">达到后自动停止</span>
+                    </label>
+                    <input type="number" id="gridTargetProfit" step="1" min="1" max="100"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <!-- 止损比例 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">
+                        止损比例 (%)
+                        <span class="text-gray-500 text-xs">亏损后自动停止</span>
+                    </label>
+                    <input type="number" id="gridStopLoss" step="1" min="-50" max="0"
+                           class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+            </div>
+
+            <div class="flex justify-end space-x-2">
+                <button id="gridDialogCancelBtn" class="px-4 py-2 bg-gray-300 rounded hover:bg-gray-400">取消</button>
+                <button id="gridDialogConfirmBtn" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">启动网格交易</button>
+            </div>
+        </div>
+    </div>
+
+
+
+    <!-- 全局网格状态Tooltip -->
+    <div id="gridTooltip" class="grid-tooltip">
+      <div class="tooltip-header">
+        <span id="tooltipStockCode" class="tooltip-stock-code"></span>
+        <span class="tooltip-risk-badge" id="tooltipRiskLevel"></span>
+      </div>
+      <div class="tooltip-body">
+        <div class="tooltip-row">
+          <span class="tooltip-label">运行时长:</span>
+          <span class="tooltip-value" id="tooltipDuration"></span>
+        </div>
+        <div class="tooltip-row">
+          <span class="tooltip-label">网格盈亏:</span>
+          <span class="tooltip-value profit" id="tooltipProfit"></span>
+        </div>
+        <div class="tooltip-row">
+          <span class="tooltip-label">交易次数:</span>
+          <span class="tooltip-value" id="tooltipTrades"></span>
+        </div>
+        <div class="tooltip-row">
+          <span class="tooltip-label">资金使用:</span>
+          <span class="tooltip-value" id="tooltipInvestment"></span>
+        </div>
+        <div class="tooltip-row">
+          <span class="tooltip-label">中心价偏离:</span>
+          <span class="tooltip-value" id="tooltipDeviation"></span>
+        </div>
+      </div>
+      <div class="tooltip-footer">
+        点击复选框查看详细信息
+      </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
