@@ -441,6 +441,14 @@ class XtQuantClient:
             return False
         return resp.get("success", False)
 
+    def get_instrument_detail(self, stock_code: str) -> dict:
+        """
+        获取合约基础信息。
+
+        若服务端未提供独立合约详情接口，则返回空 dict，由调用方继续使用其它兜底来源。
+        """
+        return {}
+
     # ------------------------------------------------------------------
     # 可观测性接口
     # ------------------------------------------------------------------
@@ -589,4 +597,22 @@ class XtDataAdapter:
             start_time=start_time,
             end_time=end_time,
         )
+
+    def get_instrument_detail(self, stock_code: str, iscomplete: bool = False) -> dict:
+        """获取合约基础信息（兼容 xtquant.xtdata.get_instrument_detail()）。"""
+        return self._client.get_instrument_detail(stock_code)
+
+    def subscribe_quote(
+        self,
+        stock_code: str,
+        period: str = "tick",
+        start_time: str = "",
+        end_time: str = "",
+        count: int = 0,
+        callback=None,
+    ) -> None:
+        """no-op：XtQuantManager 模式下行情推送由服务端管理，客户端无需主动订阅。
+        保留此方法仅为兼容 xtquant.xtdata.subscribe_quote() 调用方，不报错即可。
+        """
+        pass
 

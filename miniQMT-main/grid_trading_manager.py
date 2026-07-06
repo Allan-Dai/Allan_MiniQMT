@@ -27,6 +27,7 @@ class GridSession:
     id: Optional[int] = None
     stock_code: str = ""
     status: str = "active"
+    enabled: bool = True
 
     # 价格配置
     center_price: float = 0.0
@@ -292,13 +293,126 @@ class GridTradingManager:
     """网格交易管理器"""
 
     @staticmethod
+    def _session_field(session, name: str, default=None):
+        """兼容 GridSession 对象和数据库 dict/Row 的字段读取。"""
+        if isinstance(session, dict):
+            return session.get(name, default)
+        if hasattr(session, name):
+            return getattr(session, name)
+        try:
+            return session[name]
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
     def _extract_order_id(result) -> str:
         """兼容 executor 返回 dict/str 的订单号"""
         if isinstance(result, dict):
-            return result.get('order_id', '')
-        if isinstance(result, str):
-            return result
+            order_id = result.get('order_id', '')
+            return str(order_id) if order_id is not None else ''
+        if result is not None and not isinstance(result, bool):
+            return str(result)
         return ''
+
+    @staticmethod
+    def _is_dataframe_like(value) -> bool:
+        return hasattr(value, 'iterrows') and hasattr(value, 'columns')
+
+    @staticmethod
+    def _coerce_records(value) -> list:
+        """兼容 list/dict/pandas.DataFrame 的券商查询结果。"""
+        if value is None:
+            return []
+        if GridTradingManager._is_dataframe_like(value):
+            try:
+                return [row.to_dict() for _, row in value.iterrows()]
+            except Exception:
+                return []
+        if isinstance(value, dict):
+            for key in ('orders', 'trades', 'data', 'items', 'result'):
+                nested = value.get(key)
+                if nested is not None:
+                    return GridTradingManager._coerce_records(nested)
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return list(value)
+        return [value]
+
+    @classmethod
+    def _field_any(cls, obj, names, default=None):
+        """从对象或字典读取多个候选字段，兼容 QMT 对象和本地 DataFrame 字段。"""
+        for name in names:
+            if isinstance(obj, dict) and name in obj:
+                return obj.get(name)
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        return default
+
+    @classmethod
+    def _record_order_id(cls, obj):
+        value = cls._field_any(obj, (
+            'order_id', 'm_strOrderID', 'm_strOrderSysID', 'order_sys_id', 'order_sysid',
+            '委托编号', '订单编号', '柜台合同编号'
+        ))
+        return str(value) if value is not None else ''
+
+    @classmethod
+    def _record_stock_code(cls, obj):
+        value = cls._field_any(obj, ('stock_code', 'm_strInstrumentID', '证券代码', 'instrument_id'))
+        return str(value) if value is not None else ''
+
+    @classmethod
+    def _record_status(cls, obj):
+        value = cls._field_any(obj, ('order_status', 'm_nOrderStatus', 'status', '委托状态'))
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _record_traded_volume(cls, obj) -> int:
+        value = cls._field_any(obj, (
+            'traded_volume', 'm_nVolume', 'm_nTradedVolume', 'filled_volume',
+            '成交数量'
+        ), 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _record_traded_price(cls, obj) -> float:
+        value = cls._field_any(obj, (
+            'traded_price', 'm_dPrice', 'm_dTradedPrice', 'filled_price',
+            '成交均价'
+        ), 0)
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _record_trade_id(cls, obj):
+        value = cls._field_any(obj, ('trade_id', 'traded_id', 'm_strTradeID', '成交编号'))
+        return str(value) if value is not None else ''
 
     def __init__(self, db_manager, position_manager, trading_executor):
         self.db = db_manager
@@ -311,12 +425,145 @@ class GridTradingManager:
         self.level_cooldowns: Dict[tuple, float] = {}
         self.last_buy_times: Dict[int, float] = {}  # {session_id: timestamp} 每次成功买入后记录时间，支持 GRID_BUY_COOLDOWN
         self.last_sell_times: Dict[int, float] = {}  # {session_id: timestamp} 每次成功卖出后记录时间，支持 GRID_SELL_COOLDOWN（A-4修复）
+        self.last_sell_prices: Dict[int, float] = {}  # {session_id: trigger_price} 每次成功卖出时的触发价，支持自适应冷却缩短
+        self.pending_grid_orders: Dict[str, dict] = {}  # 实盘委托待成交确认: {order_id: pending_info}
+        self.submitting_grid_orders: Dict[str, dict] = {}  # 锁外下单保护: {submit_id: order_plan}
         self.lock = threading.RLock()  # 使用可重入锁,支持嵌套调用
 
         # 初始化:从数据库加载活跃会话
         logger.info(f"[GRID] GridTradingManager.__init__: 初始化网格交易管理器")
         loaded_count = self._load_active_sessions()
+        pending_count = self._load_open_grid_orders()
         logger.info(f"[GRID] GridTradingManager.__init__: 初始化完成, 已加载 {loaded_count} 个活跃会话")
+        if pending_count:
+            logger.warning(f"[GRID] GridTradingManager.__init__: 恢复 {pending_count} 个未完成网格委托，等待成交/撤废单回报")
+
+    def get_pnl_snapshot(self, session, current_price: float = None,
+                         position_snapshot=None, ledger_summary: dict = None) -> dict:
+        """返回统一的网格 PnL 快照。
+
+        用户可见利润、退出判断和日志都应使用这个方法，避免同一会话出现
+        "退出按 True PnL，展示按现金流" 的口径不一致。
+        """
+        session_id = self._session_field(session, 'id')
+        stock_code = self._session_field(session, 'stock_code', '')
+        max_investment = self._safe_float(self._session_field(session, 'max_investment'), 0.0)
+        total_buy_amount = self._safe_float(self._session_field(session, 'total_buy_amount'), 0.0)
+        total_sell_amount = self._safe_float(self._session_field(session, 'total_sell_amount'), 0.0)
+        total_buy_volume = self._safe_int(self._session_field(session, 'total_buy_volume'), 0)
+        total_sell_volume = self._safe_int(self._session_field(session, 'total_sell_volume'), 0)
+        current_center = self._safe_float(self._session_field(session, 'current_center_price'), 0.0)
+        center_price = self._safe_float(self._session_field(session, 'center_price'), 0.0)
+
+        mark_price = self._safe_float(current_price, 0.0)
+        if mark_price <= 0:
+            mark_price = current_center if current_center > 0 else center_price
+
+        cash_flow_profit = total_sell_amount - total_buy_amount
+        cash_flow_ratio = cash_flow_profit / max_investment if max_investment > 0 else 0.0
+        open_volume = total_buy_volume - total_sell_volume
+
+        snapshot = {
+            'stock_code': stock_code,
+            'session_id': session_id,
+            'method': 'cash_flow_legacy',
+            'method_detail': 'fallback_mi',
+            'mark_price': mark_price,
+            'profit_ratio': cash_flow_ratio,
+            'total_pnl_ratio': cash_flow_ratio,
+            'total_pnl': cash_flow_profit,
+            'realized_pnl': cash_flow_profit,
+            'unrealized_pnl': 0.0,
+            'cash_flow_profit': cash_flow_profit,
+            'cash_flow_ratio': cash_flow_ratio,
+            'open_volume': open_volume,
+            'matched_volume': 0,
+            'unmatched_volume': 0,
+            'has_ledger': False,
+            'is_degraded': True,
+            'denominator': max_investment,
+            'denominator_type': 'max_investment'
+        }
+
+        if ledger_summary is None and session_id is not None and hasattr(self.db, 'get_grid_ledger_summary'):
+            try:
+                ledger_summary = self.db.get_grid_ledger_summary(session_id, mark_price)
+            except Exception as ledger_err:
+                logger.warning(f"[GRID] get_pnl_snapshot: 账本盈亏汇总失败，降级旧口径: {ledger_err}")
+
+        if ledger_summary and ledger_summary.get('has_ledger'):
+            total_pnl = self._safe_float(ledger_summary.get('true_pnl'), 0.0)
+            profit_ratio = total_pnl / max_investment if max_investment > 0 else 0.0
+            snapshot.update({
+                'method': 'ledger_true_pnl',
+                'method_detail': (
+                    f"ledger(open={ledger_summary.get('open_volume', 0)}, "
+                    f"realized={self._safe_float(ledger_summary.get('realized_pnl')):.2f}, "
+                    f"unrealized={self._safe_float(ledger_summary.get('unrealized_pnl')):.2f})"
+                ),
+                'profit_ratio': profit_ratio,
+                'total_pnl_ratio': profit_ratio,
+                'total_pnl': total_pnl,
+                'realized_pnl': self._safe_float(ledger_summary.get('realized_pnl'), 0.0),
+                'unrealized_pnl': self._safe_float(ledger_summary.get('unrealized_pnl'), 0.0),
+                'open_volume': self._safe_int(ledger_summary.get('open_volume'), 0),
+                'matched_volume': self._safe_int(ledger_summary.get('matched_volume'), 0),
+                'unmatched_volume': self._safe_int(ledger_summary.get('unmatched_volume'), 0),
+                'has_ledger': True,
+                'is_degraded': False,
+                'denominator': max_investment,
+                'denominator_type': 'max_investment'
+            })
+            return snapshot
+
+        if total_buy_volume > 0 or total_sell_volume > 0:
+            if mark_price > 0:
+                realized = cash_flow_profit
+                unrealized = open_volume * mark_price
+                total_pnl = realized + unrealized
+                profit_ratio = total_pnl / max_investment if max_investment > 0 else 0.0
+                snapshot.update({
+                    'method': 'memory_true_pnl',
+                    'method_detail': f"true_pnl(open_vol={open_volume}, price={mark_price:.2f})",
+                    'profit_ratio': profit_ratio,
+                    'total_pnl_ratio': profit_ratio,
+                    'total_pnl': total_pnl,
+                    'realized_pnl': realized,
+                    'unrealized_pnl': unrealized,
+                    'open_volume': open_volume,
+                    'is_degraded': False,
+                    'denominator': max_investment,
+                    'denominator_type': 'max_investment'
+                })
+                return snapshot
+            snapshot.update({
+                'method': 'cash_flow_legacy',
+                'method_detail': 'fallback_no_mark_price',
+                'is_degraded': True
+            })
+            return snapshot
+
+        position_volume = 0
+        if position_snapshot:
+            position_volume = self._safe_float(position_snapshot.get('volume', 0), 0.0)
+        if position_volume > 0 and mark_price > 0:
+            denominator = position_volume * mark_price
+            profit_ratio = cash_flow_profit / denominator if denominator > 0 else 0.0
+            snapshot.update({
+                'method': 'fallback_market_value_ratio',
+                'method_detail': f"fallback_mv({position_volume:.0f}x{mark_price:.2f})",
+                'profit_ratio': profit_ratio,
+                'total_pnl_ratio': profit_ratio,
+                'total_pnl': cash_flow_profit,
+                'realized_pnl': cash_flow_profit,
+                'unrealized_pnl': 0.0,
+                'is_degraded': True,
+                'denominator': denominator,
+                'denominator_type': 'position_market_value'
+            })
+            return snapshot
+
+        return snapshot
 
     @staticmethod
     def _normalize_code(stock_code: str) -> str:
@@ -413,6 +660,7 @@ class GridTradingManager:
                         id=session_dict['id'],
                         stock_code=session_dict['stock_code'],
                         status=session_dict['status'],
+                        enabled=bool(session_dict.get('enabled', 1)),
                         center_price=session_dict['center_price'],
                         current_center_price=session_dict['current_center_price'],
                         price_interval=session_dict['price_interval'],
@@ -433,6 +681,23 @@ class GridTradingManager:
                         start_time=datetime.fromisoformat(session_dict['start_time']),
                         end_time=end_time
                     )
+
+                    # 重启恢复时重建账本，修复历史“先卖后买”未反向配对的数据。
+                    if hasattr(self.db, 'rebuild_grid_ledger_for_session'):
+                        try:
+                            ledger_rebuild = self.db.rebuild_grid_ledger_for_session(session_id)
+                            rebuilt_investment = self._safe_float(
+                                ledger_rebuild.get('current_investment'),
+                                session.current_investment
+                            )
+                            if abs(rebuilt_investment - session.current_investment) > 0.01:
+                                logger.warning(
+                                    f"[GRID] 账本重建修正资金占用 session_id={session_id} "
+                                    f"{session.current_investment:.2f} -> {rebuilt_investment:.2f}"
+                                )
+                            session.current_investment = rebuilt_investment
+                        except Exception as ledger_err:
+                            logger.warning(f"[GRID] 重启恢复时账本重建失败，保留原账本: {ledger_err}")
 
                     # ── V2 修复：DB 加载时校验 current_investment ───────────────────────────
                     # 场景：上次运行中买入成功但 DB 写入 current_investment 失败（磁盘/网络异常），
@@ -511,6 +776,187 @@ class GridTradingManager:
             logger.error(f"[GRID] 加载活跃会话失败: {str(e)}")
             return 0
 
+    def _load_open_grid_orders(self) -> int:
+        """系统启动时恢复尚未终结的网格委托"""
+        if not hasattr(self.db, 'get_open_grid_orders'):
+            return 0
+
+        try:
+            open_orders = self.db.get_open_grid_orders()
+        except Exception as e:
+            logger.warning(f"[GRID] 恢复未完成网格委托失败: {e}")
+            return 0
+
+        recovered = 0
+        for order in open_orders:
+            stock_code = order.get('stock_code')
+            session_id = order.get('session_id')
+            session = (
+                self.sessions.get(self._normalize_code(stock_code))
+                or self.sessions.get(stock_code)
+            )
+            if not session or session.id != session_id or session.status != 'active':
+                try:
+                    self.db.update_grid_order(order['order_id'], {
+                        'status': 'orphaned',
+                        'last_error': 'active session not found during recovery'
+                    })
+                except Exception:
+                    pass
+                logger.warning(
+                    f"[GRID] 未完成委托无法恢复，已标记orphaned order_id={order.get('order_id')}, "
+                    f"session_id={session_id}, stock_code={stock_code}"
+                )
+                continue
+
+            try:
+                signal = json.loads(order.get('raw_signal') or '{}')
+            except Exception:
+                signal = {}
+            if not signal:
+                signal = {
+                    'stock_code': stock_code,
+                    'signal_type': order.get('side'),
+                    'grid_level': session.current_center_price,
+                    'trigger_price': order.get('expected_price'),
+                    'session_id': session_id,
+                }
+
+            self.pending_grid_orders[str(order['order_id'])] = {
+                'order_id': str(order['order_id']),
+                'session_id': session_id,
+                'stock_code': stock_code,
+                'side': order.get('side'),
+                'signal': signal,
+                'requested_volume': int(order.get('requested_volume') or 0),
+                'expected_price': float(order.get('expected_price') or 0),
+                'reserved_price': float(order.get('reserved_price') or order.get('expected_price') or 0),
+                'filled_volume': int(order.get('filled_volume') or 0),
+                'filled_amount': float(order.get('filled_amount') or 0),
+                'confirmed_trade_ids': set(),
+                'created_at': order.get('submitted_at') or datetime.now().isoformat()
+            }
+            recovered += 1
+
+        if recovered:
+            self._reconcile_open_grid_orders()
+
+        return recovered
+
+    def _query_broker_orders_for_reconcile(self) -> list:
+        """查询券商当日委托，接口不可用时返回空列表。"""
+        candidates = [
+            (self.executor, ('query_stock_orders', 'get_orders', 'query_orders')),
+            (getattr(self.position_manager, 'qmt_trader', None), ('query_stock_orders', 'today_entrusts')),
+        ]
+        for target, method_names in candidates:
+            if not target:
+                continue
+            for method_name in method_names:
+                method = getattr(target, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    records = self._coerce_records(method())
+                    logger.info(f"[GRID] 启动对账: 通过 {type(target).__name__}.{method_name} 查询委托 {len(records)} 条")
+                    return records
+                except TypeError:
+                    continue
+                except Exception as e:
+                    logger.warning(f"[GRID] 启动对账: 查询券商委托失败 {method_name}: {e}")
+                    return []
+        logger.debug("[GRID] 启动对账: 未找到券商委托查询接口")
+        return []
+
+    def _query_broker_trades_for_reconcile(self) -> list:
+        """查询券商当日成交，接口不可用时返回空列表。"""
+        candidates = [
+            (self.executor, ('query_stock_trades', 'get_trades', 'query_trades')),
+            (getattr(self.position_manager, 'qmt_trader', None), ('query_stock_trades', 'today_trades')),
+        ]
+        for target, method_names in candidates:
+            if not target:
+                continue
+            for method_name in method_names:
+                method = getattr(target, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    records = self._coerce_records(method())
+                    logger.info(f"[GRID] 启动对账: 通过 {type(target).__name__}.{method_name} 查询成交 {len(records)} 条")
+                    return records
+                except TypeError:
+                    continue
+                except Exception as e:
+                    logger.warning(f"[GRID] 启动对账: 查询券商成交失败 {method_name}: {e}")
+                    return []
+        logger.debug("[GRID] 启动对账: 未找到券商成交查询接口")
+        return []
+
+    def _reconcile_open_grid_orders(self) -> None:
+        """启动时用券商当日委托/成交补偿本地未完成网格委托。"""
+        if getattr(config, 'ENABLE_SIMULATION_MODE', True):
+            return
+        if not self.pending_grid_orders:
+            return
+
+        logger.info(f"[GRID] 启动对账: 开始处理 {len(self.pending_grid_orders)} 个未完成网格委托")
+        broker_trades = self._query_broker_trades_for_reconcile()
+        broker_orders = self._query_broker_orders_for_reconcile()
+
+        replayed = 0
+        for order_id in list(self.pending_grid_orders.keys()):
+            for trade in broker_trades:
+                if self._record_order_id(trade) != str(order_id):
+                    continue
+                if self.handle_deal_callback(trade):
+                    replayed += 1
+
+        terminal_status_map = {
+            53: 'partially_canceled',
+            54: 'canceled',
+            56: 'filled',
+            57: 'rejected',
+        }
+        closed = 0
+        for order_id in list(self.pending_grid_orders.keys()):
+            matched_order = None
+            for order in broker_orders:
+                if self._record_order_id(order) == str(order_id):
+                    matched_order = order
+                    break
+            if matched_order is None:
+                continue
+
+            status = self._record_status(matched_order)
+            if status not in terminal_status_map:
+                continue
+
+            if status == 56:
+                pending = self.pending_grid_orders.get(str(order_id))
+                traded_volume = self._record_traded_volume(matched_order)
+                traded_price = self._record_traded_price(matched_order)
+                if pending and traded_volume > pending.get('filled_volume', 0) and traded_price > 0:
+                    trade_id = f"{order_id}_ORDER_FILLED_RECON"
+                    synthetic_trade = {
+                        'order_id': str(order_id),
+                        'stock_code': pending.get('stock_code'),
+                        'traded_volume': traded_volume - int(pending.get('filled_volume') or 0),
+                        'traded_price': traded_price,
+                        'trade_id': trade_id,
+                    }
+                    if self.handle_deal_callback(synthetic_trade):
+                        replayed += 1
+                continue
+
+            if self.handle_order_callback(matched_order):
+                closed += 1
+
+        logger.info(
+            f"[GRID] 启动对账完成: 成交补记={replayed}, 终态关闭={closed}, "
+            f"剩余pending={len(self.pending_grid_orders)}"
+        )
+
     def start_grid_session(self, stock_code: str, user_config: dict) -> GridSession:
         """启动网格交易会话（三阶段设计，避免AB-BA死锁）
 
@@ -549,7 +995,7 @@ class GridTradingManager:
         # 检查是否要求已触发止盈（可配置）
         if config.GRID_REQUIRE_PROFIT_TRIGGERED and not position.get('profit_triggered'):
             logger.warning(f"[GRID] start_grid_session: [阶段1] {stock_code}未触发止盈, 拒绝启动 (GRID_REQUIRE_PROFIT_TRIGGERED=True)")
-            raise ValueError(f"{stock_code}未触发首次止盈，无法启动网格交易")
+            raise ValueError(f"{stock_code}未触发止盈（未触发首次止盈），无法启动网格交易")
 
         logger.debug(f"[GRID] start_grid_session: [阶段1] 前置条件验证通过, volume={position.get('volume')}, profit_triggered={position.get('profit_triggered')}")
 
@@ -612,6 +1058,7 @@ class GridTradingManager:
                 id=session_id,
                 stock_code=stock_code,
                 status='active',
+                enabled=True,
                 center_price=center_price,  # ✅ 使用阶段1确定的中心价格
                 current_center_price=center_price,  # ✅ 初始化为相同值
                 price_interval=session_data['price_interval'],
@@ -660,22 +1107,192 @@ class GridTradingManager:
         return session
 
     def stop_grid_session(self, session_id: int, reason: str) -> dict:
-        """停止网格交易会话（公共接口，会获取锁）"""
+        """停止网格交易会话（公共接口，会获取锁）
+
+        实盘成交确认模式下采用撤单闭环:
+        1. 若存在提交中/待成交委托，先把会话置为 stopping，并对待成交委托发撤单请求。
+        2. 等委托终态回调或锁外下单完成后，再真正清理内存会话。
+        3. 无未完成委托时保持旧行为，立即停止。
+        """
         logger.info(f"[GRID] stop_grid_session: 开始停止会话 session_id={session_id}, reason={reason}")
 
+        cancel_orders = []
         with self.lock:
-            return self._stop_grid_session_unlocked(session_id, reason)
+            session = self._find_session_by_id(session_id)
+            if not session:
+                logger.warning(f"[GRID] stop_grid_session: 会话{session_id}不存在, 无法停止")
+                raise ValueError(f"会话{session_id}不存在")
+
+            open_orders = [
+                (order_id, pending)
+                for order_id, pending in self.pending_grid_orders.items()
+                if pending.get('session_id') == session_id
+            ]
+            submitting_orders = [
+                plan
+                for plan in self.submitting_grid_orders.values()
+                if plan.get('session_id') == session_id
+            ]
+
+            if open_orders or submitting_orders:
+                session.status = 'stopping'
+                session.stop_reason = reason
+                if hasattr(self.db, 'update_grid_session'):
+                    self.db.update_grid_session(session_id, {
+                        'status': 'stopping',
+                        'stop_reason': reason
+                    })
+
+                for order_id, pending in open_orders:
+                    pending['stop_requested'] = True
+                    pending['stop_reason'] = reason
+                    cancel_orders.append(order_id)
+                    try:
+                        if hasattr(self.db, 'update_grid_order'):
+                            self.db.update_grid_order(order_id, {
+                                'status': 'cancel_requested',
+                                'last_error': f'stop requested: {reason}'
+                            })
+                    except Exception as db_err:
+                        logger.warning(f"[GRID] stop_grid_session: 标记撤单请求失败 order_id={order_id}, err={db_err}")
+
+                for plan in submitting_orders:
+                    plan['stop_requested'] = True
+                    plan['stop_reason'] = reason
+
+                logger.warning(
+                    f"[GRID] stop_grid_session: session_id={session_id} 进入stopping，"
+                    f"待撤单={len(open_orders)}, 提交中={len(submitting_orders)}"
+                )
+            else:
+                return self._stop_grid_session_unlocked(session_id, reason)
+
+        cancel_ok = 0
+        cancel_failed = 0
+        for order_id in cancel_orders:
+            if self._cancel_grid_order(order_id):
+                cancel_ok += 1
+            else:
+                cancel_failed += 1
+                with self.lock:
+                    pending = self.pending_grid_orders.get(str(order_id))
+                    if pending:
+                        try:
+                            if hasattr(self.db, 'update_grid_order'):
+                                self.db.update_grid_order(order_id, {
+                                    'status': 'cancel_failed',
+                                    'last_error': f'cancel failed during stop: {reason}'
+                                })
+                        except Exception as db_err:
+                            logger.warning(f"[GRID] stop_grid_session: 写入撤单失败状态失败 order_id={order_id}, err={db_err}")
+
+        with self.lock:
+            still_open = any(
+                p.get('session_id') == session_id
+                for p in self.pending_grid_orders.values()
+            )
+            still_submitting = any(
+                p.get('session_id') == session_id
+                for p in self.submitting_grid_orders.values()
+            )
+            if not still_open and not still_submitting:
+                return self._stop_grid_session_unlocked(session_id, reason)
+
+        pnl_snapshot = self.get_pnl_snapshot(
+            session,
+            current_price=session.current_center_price or session.center_price
+        )
+
+        return {
+            'stock_code': session.stock_code,
+            'trade_count': session.trade_count,
+            'profit_ratio': pnl_snapshot['profit_ratio'],
+            'grid_profit': pnl_snapshot['total_pnl'],
+            'pnl_snapshot': pnl_snapshot,
+            'stop_reason': reason,
+            'status': 'stopping',
+            'pending_orders': len(cancel_orders),
+            'cancel_requested': cancel_ok,
+            'cancel_failed': cancel_failed
+        }
+
+    def set_session_enabled(self, session_id: int, enabled: bool) -> dict:
+        """设置单个网格会话是否允许自动产生新单。"""
+        with self.lock:
+            session = self._find_session_by_id(session_id)
+            if not session:
+                raise ValueError(f"会话{session_id}不存在")
+
+            session.enabled = bool(enabled)
+            self.db.update_grid_session(session_id, {'enabled': 1 if enabled else 0})
+            try:
+                self.position_manager._increment_data_version()
+            except Exception:
+                pass
+
+            logger.info(
+                f"[GRID] set_session_enabled: session_id={session_id}, "
+                f"stock_code={session.stock_code}, enabled={session.enabled}"
+            )
+            return {
+                'session_id': session.id,
+                'stock_code': session.stock_code,
+                'enabled': session.enabled,
+                'status': session.status
+            }
+
+    def _find_session_by_id(self, session_id: int) -> Optional[GridSession]:
+        """按会话ID查找内存会话。"""
+        for s in self.sessions.values():
+            if s.id == session_id:
+                return s
+        return None
+
+    def _cancel_grid_order(self, order_id: str) -> bool:
+        """锁外发起网格委托撤单请求。"""
+        order_id = str(order_id)
+        try:
+            if hasattr(self.executor, 'cancel_order'):
+                ok = bool(self.executor.cancel_order(order_id))
+            elif hasattr(self.executor, 'cancel_order_stock'):
+                ok = self.executor.cancel_order_stock(order_id) == 0
+            else:
+                logger.error(f"[GRID] _cancel_grid_order: executor缺少撤单接口 order_id={order_id}")
+                return False
+            logger.info(f"[GRID] _cancel_grid_order: order_id={order_id}, ok={ok}")
+            return ok
+        except Exception as e:
+            logger.error(f"[GRID] _cancel_grid_order: 撤单异常 order_id={order_id}, err={e}", exc_info=True)
+            return False
+
+    def _complete_stop_if_no_open_orders_unlocked(self, session_id: int) -> bool:
+        """stopping 会话在所有未完成委托终结后自动完成停止。"""
+        session = self._find_session_by_id(session_id)
+        if not session or session.status != 'stopping':
+            return False
+
+        has_pending = any(
+            p.get('session_id') == session_id
+            for p in self.pending_grid_orders.values()
+        )
+        has_submitting = any(
+            p.get('session_id') == session_id
+            for p in self.submitting_grid_orders.values()
+        )
+        if has_pending or has_submitting:
+            return False
+
+        reason = session.stop_reason or 'stopped_after_orders_closed'
+        self._stop_grid_session_unlocked(session_id, reason)
+        logger.info(f"[GRID] stopping会话已完成停止 session_id={session_id}, reason={reason}")
+        return True
 
     def _stop_grid_session_unlocked(self, session_id: int, reason: str) -> dict:
         """停止网格交易会话（内部方法，调用者必须已持有锁）"""
         logger.info(f"[GRID] _stop_grid_session_unlocked: 开始停止会话 session_id={session_id}, reason={reason}")
 
         # 查找会话
-        session = None
-        for s in self.sessions.values():
-            if s.id == session_id:
-                session = s
-                break
+        session = self._find_session_by_id(session_id)
 
         if not session:
             logger.warning(f"[GRID] _stop_grid_session_unlocked: 会话{session_id}不存在, 无法停止")
@@ -685,14 +1302,22 @@ class GridTradingManager:
         stock_code_key = self._normalize_code(stock_code)  # 用于 sessions 字典操作
         logger.debug(f"[GRID] _stop_grid_session_unlocked: 找到会话 stock_code={stock_code}, key={stock_code_key}")
 
+        pnl_snapshot = self.get_pnl_snapshot(
+            session,
+            current_price=session.current_center_price or session.center_price
+        )
+
         # 记录停止前的统计信息
         logger.info(f"[GRID] _stop_grid_session_unlocked: 停止前统计:")
         logger.info(f"[GRID]   - 股票代码: {stock_code}")
         logger.info(f"[GRID]   - 总交易次数: {session.trade_count} (买入{session.buy_count}/卖出{session.sell_count})")
         logger.info(f"[GRID]   - 总买入金额: {session.total_buy_amount:.2f}")
         logger.info(f"[GRID]   - 总卖出金额: {session.total_sell_amount:.2f}")
-        logger.info(f"[GRID]   - 网格盈亏: {session.get_profit_ratio()*100:.2f}%")
-        logger.info(f"[GRID]   - 网格累计利润: {session.get_grid_profit():.2f}元")
+        logger.info(f"[GRID]   - 网格盈亏: {pnl_snapshot['profit_ratio']*100:.2f}% "
+                    f"({pnl_snapshot['method_detail']})")
+        logger.info(f"[GRID]   - 网格总PnL: {pnl_snapshot['total_pnl']:.2f}元 "
+                    f"(已实现{pnl_snapshot['realized_pnl']:.2f}, 未实现{pnl_snapshot['unrealized_pnl']:.2f})")
+        logger.info(f"[GRID]   - 现金流利润(旧口径): {pnl_snapshot['cash_flow_profit']:.2f}元")
         logger.info(f"[GRID]   - 最大投入额度: {session.max_investment:.2f}元")
         logger.info(f"[GRID]   - 当前投入: {session.current_investment:.2f}/{session.max_investment:.2f}")
         logger.info(f"[GRID]   - 中心价偏离: {session.get_deviation_ratio()*100:.2f}%")
@@ -745,12 +1370,13 @@ class GridTradingManager:
         final_stats = {
             'stock_code': stock_code,
             'trade_count': session.trade_count,
-            'profit_ratio': session.get_profit_ratio(),
+            'profit_ratio': pnl_snapshot['profit_ratio'],
+            'pnl_snapshot': pnl_snapshot,
             'stop_reason': reason
         }
 
         logger.info(f"[GRID] _stop_grid_session_unlocked: 停止完成! stock_code={stock_code}, reason={reason}, "
-                   f"trade_count={session.trade_count}, profit={session.get_profit_ratio()*100:.2f}%")
+                   f"trade_count={session.trade_count}, profit={pnl_snapshot['profit_ratio']*100:.2f}%")
 
         return final_stats
 
@@ -796,16 +1422,22 @@ class GridTradingManager:
         #           test_grid_profit_ratio_fix.py, test_grid_true_pnl.py（True P&L验证）
         if session.buy_count > 0:
             _position_volume = position_snapshot.get('volume', 0) if position_snapshot else 0
-            profit_ratio = session.get_true_pnl_ratio(current_price, _position_volume)
-            _open_vol = session.total_buy_volume - session.total_sell_volume
-            if session.total_buy_volume > 0 or session.total_sell_volume > 0:
-                _pnl_label = f"true_pnl(open_vol={_open_vol}, price={current_price:.2f})"
-            elif _position_volume > 0:
-                _pnl_label = f"fallback_mv({_position_volume:.0f}x{current_price:.2f})"
-            else:
-                _pnl_label = f"fallback_mi({session.max_investment:.0f})"
+            ledger_summary = None
+            if hasattr(self.db, 'get_grid_ledger_summary'):
+                try:
+                    ledger_summary = self.db.get_grid_ledger_summary(session.id, current_price)
+                except Exception as ledger_err:
+                    logger.warning(f"[GRID] _check_exit_conditions: 账本盈亏汇总失败，降级旧口径: {ledger_err}")
+
+            pnl_snapshot = self.get_pnl_snapshot(
+                session,
+                current_price=current_price,
+                position_snapshot=position_snapshot,
+                ledger_summary=ledger_summary
+            )
+            profit_ratio = pnl_snapshot['profit_ratio']
             logger.debug(f"[GRID] _check_exit_conditions: profit_ratio={profit_ratio*100:.2f}% "
-                        f"method={_pnl_label}, "
+                        f"method={pnl_snapshot['method_detail']}, "
                         f"target={session.target_profit*100:.2f}%, stop_loss={session.stop_loss*100:.2f}%, "
                         f"buy_count={session.buy_count}, sell_count={session.sell_count}")
 
@@ -942,6 +1574,9 @@ class GridTradingManager:
             if session.status != 'active':
                 logger.debug(f"[GRID] check_grid_signals: {stock_code} 会话状态={session.status}, 非active, 返回None")
                 return None
+            if not session.enabled:
+                logger.debug(f"[GRID] check_grid_signals: {stock_code} 个股网格开关关闭, 返回None")
+                return None
 
             logger.debug(f"[GRID] check_grid_signals: 找到活跃会话 session_id={session.id}, status={session.status}")
 
@@ -997,7 +1632,9 @@ class GridTradingManager:
             'grid_level': tracker.crossed_level,
             'trigger_price': current_price,
             'session_id': session.id,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'signal_source': 'grid_tracker',
+            'require_price_recheck': True
         }
 
         if signal_type == 'SELL':
@@ -1057,6 +1694,844 @@ class GridTradingManager:
                    f"旧中心={old_center:.2f} -> 新中心={trade_price:.2f}, "
                    f"新档位=[{levels['lower']:.2f}, {levels['center']:.2f}, {levels['upper']:.2f}]")
 
+    @staticmethod
+    def _get_attr_or_key(obj, names, default=None):
+        """从对象或字典中按多个候选字段读取值"""
+        for name in names:
+            if isinstance(obj, dict) and name in obj:
+                return obj.get(name)
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        return default
+
+    def _extract_price_from_quote(self, quote, stock_code: str):
+        """从不同行情结构中提取最新价"""
+        if not quote:
+            return None
+
+        data = quote
+        if isinstance(quote, dict):
+            normalized = self._normalize_code(stock_code)
+            for key in (stock_code, normalized):
+                nested = quote.get(key)
+                if isinstance(nested, dict):
+                    data = nested
+                    break
+
+        if isinstance(data, dict):
+            for field in ('lastPrice', 'last_price', 'price', 'close', 'lastClose'):
+                value = data.get(field)
+                if value is not None:
+                    try:
+                        price = float(value)
+                        return price if price > 0 else None
+                    except (TypeError, ValueError):
+                        continue
+        return None
+
+    def _get_latest_price_for_signal(self, stock_code: str, position_snapshot=None):
+        """执行前获取实时行情价格；拿不到盘口价时不使用持仓缓存价替代"""
+        try:
+            data_manager = getattr(self.position_manager, 'data_manager', None)
+            if data_manager and hasattr(data_manager, 'get_latest_data'):
+                quote = data_manager.get_latest_data(stock_code)
+                price = self._extract_price_from_quote(quote, stock_code)
+                if price is not None:
+                    return price
+        except Exception as e:
+            logger.warning(f"[GRID] _get_latest_price_for_signal: 获取行情失败 stock_code={stock_code}, err={e}")
+
+        return None
+
+    def _get_price_limits(self, stock_code: str):
+        """获取标的当日涨停价/跌停价。
+
+        来源: xtdata.get_instrument_detail 的 UpStopPrice/DownStopPrice 字段。
+        获取失败时返回 (None, None)，由调用方 fail-open 处理。
+        """
+        try:
+            data_manager = getattr(self.position_manager, 'data_manager', None)
+            xt = getattr(data_manager, 'xt', None) if data_manager else None
+            if xt is None or not hasattr(xt, 'get_instrument_detail'):
+                return None, None
+            detail = xt.get_instrument_detail(stock_code)
+            if not isinstance(detail, dict):
+                return None, None
+
+            def _first_positive(keys):
+                for k in keys:
+                    v = detail.get(k)
+                    if v is not None:
+                        try:
+                            fv = float(v)
+                            if fv > 0:
+                                return fv
+                        except (TypeError, ValueError):
+                            continue
+                return None
+
+            up_limit = _first_positive(('UpStopPrice', 'upStopPrice', 'HighLimit', '涨停价'))
+            down_limit = _first_positive(('DownStopPrice', 'downStopPrice', 'LowLimit', '跌停价'))
+            return up_limit, down_limit
+        except Exception as e:
+            logger.debug(f"[GRID] _get_price_limits: 获取涨跌停价失败 stock_code={stock_code}, err={e}")
+            return None, None
+
+    def _check_tradable(self, stock_code: str, signal_type: str, current_price):
+        """实盘下单前涨跌停/停牌防护。
+
+        守卫的核心价值是涨跌停拦截(executor 层不检查涨跌停)；停牌则有 executor
+        盘口兜底(对手价模式下取不到盘口价会拒单)，故停牌判定从严，避免误伤降级场景：
+
+        - 涨停板: 拦截买入(封板买不进/追涨)
+        - 跌停板: 拦截卖出(封板卖不出)
+        - 停牌: 仅当"标的明细可查(说明标的真实存在)但拿不到有效现价"时拦截；
+                明细查不到(数据源降级/测试 mock)时 fail-open，交 executor 盘口兜底。
+        - 涨跌停价获取失败: fail-open(放行)
+
+        Returns:
+            (是否可交易: bool, 原因: str)
+        """
+        up_limit, down_limit = self._get_price_limits(stock_code)
+        has_limits = up_limit is not None or down_limit is not None
+
+        # 停牌检测: 标的明细可查但无有效现价 → 疑似停牌
+        if current_price is None or current_price <= 0:
+            if has_limits:
+                return False, "标的明细可查但无有效现价(疑似停牌)"
+            return True, ""  # 明细不可查(降级/mock)，放行交 executor 兜底
+
+        eps = getattr(config, 'GRID_PRICE_LIMIT_EPS', 0.001)
+        if signal_type == 'BUY' and up_limit is not None and current_price >= up_limit - eps:
+            return False, f"已涨停(现价{current_price:.2f}>=涨停{up_limit:.2f})，跳过买入"
+        if signal_type == 'SELL' and down_limit is not None and current_price <= down_limit + eps:
+            return False, f"已跌停(现价{current_price:.2f}<=跌停{down_limit:.2f})，跳过卖出"
+        return True, ""
+
+    def _calculate_buy_reserved_price(self, stock_code: str, trigger_price: float,
+                                      use_counterparty: bool, latest_price=None) -> float:
+        """计算买入预占风险价，防止对手价成交高于触发价时突破 max_investment。"""
+        base_price = trigger_price
+        try:
+            if latest_price is not None and float(latest_price) > base_price:
+                base_price = float(latest_price)
+        except (TypeError, ValueError):
+            pass
+
+        if not use_counterparty:
+            return base_price
+
+        buffer_ratio = getattr(config, 'GRID_COUNTERPARTY_BUY_PRICE_BUFFER_RATIO', 0.02)
+        try:
+            buffer_ratio = max(0.0, float(buffer_ratio))
+        except (TypeError, ValueError):
+            buffer_ratio = 0.02
+        reserved_price = base_price * (1 + buffer_ratio)
+
+        up_limit, _ = self._get_price_limits(stock_code)
+        if up_limit is not None and up_limit > 0:
+            reserved_price = min(reserved_price, float(up_limit))
+
+        return reserved_price
+
+    def _parse_signal_timestamp(self, value):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value)
+        if isinstance(value, str):
+            return datetime.fromisoformat(value.replace('Z', '+00:00')).replace(tzinfo=None)
+        raise ValueError(f"不支持的timestamp类型: {type(value)}")
+
+    def _validate_grid_signal_before_execute(self, signal: dict, session: GridSession, latest_price=None) -> bool:
+        """执行前复核网格信号，防止旧信号、会话错配和明显价格漂移"""
+        if session.status != 'active':
+            logger.warning(f"[GRID] signal validate: 会话非active session_id={session.id}, status={session.status}")
+            return False
+
+        signal_session_id = signal.get('session_id')
+        if signal_session_id is not None and str(signal_session_id) != str(session.id):
+            logger.warning(f"[GRID] signal validate: session_id不匹配 signal={signal_session_id}, current={session.id}")
+            return False
+
+        timestamp = signal.get('timestamp')
+        if timestamp is not None:
+            try:
+                signal_time = self._parse_signal_timestamp(timestamp)
+            except Exception as e:
+                logger.warning(f"[GRID] signal validate: timestamp无效 timestamp={timestamp}, err={e}")
+                return False
+
+            max_age = getattr(config, 'GRID_SIGNAL_MAX_AGE_SECONDS', 60)
+            if max_age and max_age > 0:
+                age_seconds = (datetime.now() - signal_time).total_seconds()
+                if age_seconds > max_age:
+                    logger.warning(f"[GRID] signal validate: 信号过期 age={age_seconds:.1f}s > {max_age}s")
+                    return False
+                if age_seconds < -5:
+                    logger.warning(f"[GRID] signal validate: 信号时间来自未来 age={age_seconds:.1f}s")
+                    return False
+
+        should_check_price_drift = (
+            not getattr(config, 'ENABLE_SIMULATION_MODE', True)
+            and (
+                signal.get('require_price_recheck') is True
+                or signal.get('signal_source') == 'grid_tracker'
+            )
+        )
+        trigger_price = signal.get('trigger_price')
+        max_drift = getattr(config, 'GRID_SIGNAL_MAX_PRICE_DRIFT_RATIO', 0.01)
+        if should_check_price_drift and latest_price is not None and trigger_price and max_drift and max_drift > 0:
+            try:
+                trigger_price = float(trigger_price)
+            except (TypeError, ValueError):
+                logger.warning(f"[GRID] signal validate: trigger_price无效 value={trigger_price}")
+                return False
+            if trigger_price <= 0:
+                logger.warning(f"[GRID] signal validate: trigger_price非正 value={trigger_price}")
+                return False
+            drift = abs(float(latest_price) - trigger_price) / trigger_price
+            if drift > max_drift:
+                logger.warning(
+                    f"[GRID] signal validate: 价格漂移过大 stock_code={session.stock_code}, "
+                    f"latest={latest_price:.4f}, trigger={trigger_price:.4f}, "
+                    f"drift={drift*100:.2f}% > {max_drift*100:.2f}%"
+                )
+                return False
+        elif should_check_price_drift and timestamp is not None and signal_session_id is not None:
+            logger.debug(f"[GRID] signal validate: 未取得最新价，跳过价格漂移复核 stock_code={session.stock_code}")
+
+        return True
+
+    def _register_pending_grid_order(self, order_id: str, session: GridSession, signal: dict,
+                                     side: str, volume: int, expected_price: float) -> None:
+        normalized_order_id = str(order_id)
+        pending_info = {
+            'order_id': normalized_order_id,
+            'session_id': session.id,
+            'stock_code': session.stock_code,
+            'side': side,
+            'signal': dict(signal),
+            'requested_volume': int(volume),
+            'expected_price': float(expected_price),
+            'reserved_price': float(signal.get('reserved_price') or expected_price),
+            'filled_volume': 0,
+            'filled_amount': 0.0,
+            'confirmed_trade_ids': set(),
+            'created_at': datetime.now().isoformat()
+        }
+        if hasattr(self.db, 'create_grid_order'):
+            self.db.create_grid_order({
+                'order_id': normalized_order_id,
+                'session_id': session.id,
+                'stock_code': session.stock_code,
+                'side': side,
+                'status': 'submitted',
+                'requested_volume': int(volume),
+                'expected_price': float(expected_price),
+                'reserved_price': float(signal.get('reserved_price') or expected_price),
+                'filled_volume': 0,
+                'filled_amount': 0.0,
+                'submitted_at': pending_info['created_at'],
+                'raw_signal': json.dumps(dict(signal), ensure_ascii=False, default=str)
+            })
+        self.pending_grid_orders[normalized_order_id] = pending_info
+        logger.info(
+            f"[GRID] pending order registered: order_id={normalized_order_id}, "
+            f"session_id={session.id}, side={side}, volume={volume}, price={expected_price:.2f}"
+        )
+
+    def _record_confirmed_grid_trade(self, session: GridSession, signal: dict, side: str,
+                                     price: float, volume: int, trade_id: str,
+                                     commission: float = None) -> bool:
+        """按真实成交回报落账，并在DB失败时回滚内存统计"""
+        return self._record_confirmed_grid_trade_with_order(
+            session=session,
+            signal=signal,
+            side=side,
+            price=price,
+            volume=volume,
+            trade_id=trade_id,
+            commission=commission
+        )
+
+    def _record_confirmed_grid_trade_with_order(self, session: GridSession, signal: dict, side: str,
+                                                price: float, volume: int, trade_id: str,
+                                                order_id: str = None,
+                                                order_updates: dict = None,
+                                                commission: float = None) -> bool:
+        """按真实成交回报落账，并在DB失败时回滚内存统计"""
+        stock_code = session.stock_code
+        price = float(price)
+        volume = int(volume)
+        amount = price * volume
+
+        old_trade_count = session.trade_count
+        old_buy_count = session.buy_count
+        old_sell_count = session.sell_count
+        old_total_buy = session.total_buy_amount
+        old_total_sell = session.total_sell_amount
+        old_total_buy_vol = session.total_buy_volume
+        old_total_sell_vol = session.total_sell_volume
+        old_investment = session.current_investment
+
+        unmatched_sell_volume = 0
+        if side == 'BUY' and hasattr(self.db, 'get_unmatched_grid_sell_volume'):
+            try:
+                unmatched_sell_volume = self.db.get_unmatched_grid_sell_volume(session.id)
+            except Exception as ledger_err:
+                logger.warning(f"[GRID] 查询未匹配卖出数量失败，按普通买入处理: {ledger_err}")
+                unmatched_sell_volume = 0
+
+        session.trade_count += 1
+        if side == 'BUY':
+            session.buy_count += 1
+            session.total_buy_amount += amount
+            session.total_buy_volume += volume
+            open_buy_volume = max(0, volume - unmatched_sell_volume)
+            session.current_investment += open_buy_volume * price
+            reserved_price = self._safe_float(signal.get('reserved_price'), 0.0)
+            if reserved_price > 0 and price > reserved_price + 0.0001:
+                logger.error(
+                    f"[GRID] confirmed buy price exceeded reserved_price: stock_code={stock_code}, "
+                    f"deal_price={price:.4f}, reserved_price={reserved_price:.4f}, volume={volume}"
+                )
+            if session.current_investment > session.max_investment + 0.01:
+                logger.error(
+                    f"[GRID] confirmed buy hard cap: current_investment={session.current_investment:.4f} "
+                    f"> max_investment={session.max_investment:.4f}, 修正至max_investment"
+                )
+                session.current_investment = session.max_investment
+        else:
+            session.sell_count += 1
+            session.total_sell_amount += amount
+            session.total_sell_volume += volume
+            session.current_investment = max(0, session.current_investment - amount)
+
+        trade_data = {
+            'session_id': session.id,
+            'stock_code': stock_code,
+            'trade_type': side,
+            'grid_level': signal.get('grid_level'),
+            'trigger_price': price,
+            'volume': volume,
+            'amount': amount,
+            'peak_price': signal.get('peak_price'),
+            'valley_price': signal.get('valley_price'),
+            'callback_ratio': round(signal.get('callback_ratio'), 4) if signal.get('callback_ratio') else None,
+            'trade_id': trade_id,
+            'trade_time': datetime.now().isoformat(),
+            'grid_center_before': session.current_center_price,
+            'grid_center_after': price
+        }
+
+        updates = {
+            'trade_count': session.trade_count,
+            'current_investment': session.current_investment
+        }
+        if side == 'BUY':
+            updates.update({
+                'buy_count': session.buy_count,
+                'total_buy_amount': session.total_buy_amount,
+                'total_buy_volume': session.total_buy_volume
+            })
+        else:
+            updates.update({
+                'sell_count': session.sell_count,
+                'total_sell_amount': session.total_sell_amount,
+                'total_sell_volume': session.total_sell_volume
+            })
+
+        try:
+            if hasattr(self.db, 'record_grid_trade_and_update_session'):
+                self.db.record_grid_trade_and_update_session(
+                    trade_data,
+                    updates,
+                    order_id=order_id,
+                    order_updates=order_updates
+                )
+            else:
+                self.db.record_grid_trade(trade_data)
+                self.db.update_grid_session(session.id, updates)
+                if order_id and order_updates and hasattr(self.db, 'update_grid_order'):
+                    self.db.update_grid_order(order_id, order_updates)
+        except Exception as db_err:
+            logger.error(f"[GRID] confirmed trade DB写入失败，回滚内存统计: {db_err}")
+            session.trade_count = old_trade_count
+            session.buy_count = old_buy_count
+            session.sell_count = old_sell_count
+            session.total_buy_amount = old_total_buy
+            session.total_sell_amount = old_total_sell
+            session.total_buy_volume = old_total_buy_vol
+            session.total_sell_volume = old_total_sell_vol
+            session.current_investment = old_investment
+            return False
+
+        self._save_confirmed_trade_record(
+            stock_code=stock_code,
+            trade_time=trade_data['trade_time'],
+            trade_type=side,
+            price=price,
+            volume=volume,
+            amount=amount,
+            trade_id=trade_id,
+            commission=commission
+        )
+
+        self._rebuild_grid(session, price)
+        try:
+            self.position_manager._increment_data_version()
+        except Exception:
+            pass
+
+        logger.info(
+            f"[GRID] confirmed {side}: stock_code={stock_code}, volume={volume}, "
+            f"price={price:.2f}, amount={amount:.2f}, trade_id={trade_id}"
+        )
+        return True
+
+    def _save_confirmed_trade_record(self, stock_code: str, trade_time: str, trade_type: str,
+                                     price: float, volume: int, amount: float, trade_id: str,
+                                     commission: float = None) -> None:
+        """实盘网格成交确认后，补写普通交易流水。"""
+        if (getattr(config, 'ENABLE_SIMULATION_MODE', True)
+                or not getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True)):
+            return
+
+        save_trade_record = getattr(self.executor, '_save_trade_record', None)
+        if not callable(save_trade_record):
+            return
+
+        if commission is None:
+            commission = amount * 0.0003
+
+        try:
+            saved = save_trade_record(
+                stock_code=stock_code,
+                trade_time=str(trade_time).replace('T', ' '),
+                trade_type=trade_type,
+                price=price,
+                volume=volume,
+                amount=amount,
+                trade_id=trade_id,
+                commission=commission,
+                strategy=getattr(config, 'GRID_STRATEGY_NAME', 'grid')
+            )
+            if not saved:
+                logger.warning(f"[GRID] confirmed trade_records写入失败: trade_id={trade_id}")
+        except Exception as err:
+            logger.warning(f"[GRID] confirmed trade_records写入异常: trade_id={trade_id}, err={err}")
+
+    def handle_deal_callback(self, trade) -> bool:
+        """实盘成交回调确认网格委托；只有真实成交后才更新网格统计和交易表"""
+        order_id = self._get_attr_or_key(trade, ('order_id', 'm_strOrderID', 'order_sys_id'))
+        if order_id is None:
+            return False
+        order_id = str(order_id)
+
+        with self.lock:
+            pending = self.pending_grid_orders.get(order_id)
+            if not pending:
+                return False
+
+            price = self._get_attr_or_key(trade, ('traded_price', 'm_dPrice', 'price'))
+            volume = self._get_attr_or_key(trade, ('traded_volume', 'm_nVolume', 'volume'))
+            stock_code = self._get_attr_or_key(trade, ('stock_code', 'm_strInstrumentID'), pending['stock_code'])
+            raw_trade_id = self._get_attr_or_key(trade, ('trade_id', 'traded_id', 'm_strTradeID'))
+            commission = self._get_attr_or_key(trade, ('commission', 'm_dComssion', 'm_dCommission'))
+
+            try:
+                price = float(price)
+                volume = int(volume)
+                commission = float(commission) if commission is not None else None
+            except (TypeError, ValueError):
+                logger.warning(f"[GRID] handle_deal_callback: 成交价格/数量无效 order_id={order_id}, price={price}, volume={volume}")
+                return False
+            if price <= 0 or volume <= 0:
+                logger.warning(f"[GRID] handle_deal_callback: 成交价格/数量非正 order_id={order_id}, price={price}, volume={volume}")
+                return False
+
+            if self._normalize_code(str(stock_code)) != self._normalize_code(pending['stock_code']):
+                logger.warning(
+                    f"[GRID] handle_deal_callback: 股票代码不匹配 order_id={order_id}, "
+                    f"callback={stock_code}, pending={pending['stock_code']}"
+                )
+                return False
+
+            remaining = pending['requested_volume'] - pending.get('filled_volume', 0)
+            if remaining <= 0:
+                self.pending_grid_orders.pop(order_id, None)
+                return False
+            confirmed_volume = min(volume, remaining)
+
+            trade_id = str(raw_trade_id) if raw_trade_id else f"{order_id}_{pending.get('filled_volume', 0) + confirmed_volume}"
+            confirmed_trade_ids = pending.setdefault('confirmed_trade_ids', set())
+            if trade_id in confirmed_trade_ids:
+                logger.warning(f"[GRID] handle_deal_callback: 重复成交回报已忽略 trade_id={trade_id}, order_id={order_id}")
+                return False
+            if hasattr(self.db, 'grid_trade_exists') and self.db.grid_trade_exists(trade_id):
+                logger.warning(f"[GRID] handle_deal_callback: 成交已在DB落账，忽略重复回报 trade_id={trade_id}, order_id={order_id}")
+                confirmed_trade_ids.add(trade_id)
+                return False
+
+            session = (
+                self.sessions.get(self._normalize_code(pending['stock_code']))
+                or self.sessions.get(pending['stock_code'])
+            )
+            if not session or session.status not in ('active', 'stopping'):
+                logger.warning(f"[GRID] handle_deal_callback: 会话不存在或非active order_id={order_id}, session_id={pending['session_id']}")
+                return False
+
+            new_filled_volume = pending.get('filled_volume', 0) + confirmed_volume
+            new_filled_amount = pending.get('filled_amount', 0.0) + price * confirmed_volume
+            order_status = 'filled' if new_filled_volume >= pending['requested_volume'] else 'partial_filled'
+
+            success = self._record_confirmed_grid_trade_with_order(
+                session=session,
+                signal=pending['signal'],
+                side=pending['side'],
+                price=price,
+                volume=confirmed_volume,
+                trade_id=trade_id,
+                order_id=order_id,
+                order_updates={
+                    'status': order_status,
+                    'filled_volume': new_filled_volume,
+                    'filled_amount': new_filled_amount
+                },
+                commission=commission
+            )
+            if not success:
+                return False
+
+            pending['filled_volume'] = new_filled_volume
+            pending['filled_amount'] = new_filled_amount
+            confirmed_trade_ids.add(trade_id)
+
+            if pending['filled_volume'] >= pending['requested_volume']:
+                self.pending_grid_orders.pop(order_id, None)
+                logger.info(f"[GRID] handle_deal_callback: 委托已全部成交并移除 pending order_id={order_id}")
+            else:
+                logger.info(
+                    f"[GRID] handle_deal_callback: 委托部分成交 order_id={order_id}, "
+                    f"filled={pending['filled_volume']}/{pending['requested_volume']}"
+                )
+            self._complete_stop_if_no_open_orders_unlocked(pending['session_id'])
+            return True
+
+    def handle_order_callback(self, order) -> bool:
+        """处理网格委托状态回报，撤单/废单/拒单时清理 pending 委托"""
+        order_id = self._get_attr_or_key(order, ('order_id', 'm_strOrderSysID', 'order_sys_id'))
+        if order_id is None:
+            return False
+        order_id = str(order_id)
+
+        status = self._get_attr_or_key(order, ('order_status', 'm_nOrderStatus', 'status'))
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            return False
+
+        terminal_status_map = {
+            53: 'partially_canceled',
+            54: 'canceled',
+            57: 'rejected',
+        }
+        if status not in terminal_status_map:
+            return False
+
+        with self.lock:
+            pending = self.pending_grid_orders.get(order_id)
+            if not pending:
+                if hasattr(self.db, 'get_grid_order') and self.db.get_grid_order(order_id):
+                    try:
+                        self.db.update_grid_order(order_id, {
+                            'status': terminal_status_map[status],
+                            'last_error': f'order terminal status {status}'
+                        })
+                    except Exception as db_err:
+                        logger.warning(f"[GRID] handle_order_callback: 更新历史委托状态失败 order_id={order_id}, err={db_err}")
+                    return True
+                return False
+
+            filled_volume = int(pending.get('filled_volume') or 0)
+            requested_volume = int(pending.get('requested_volume') or 0)
+            new_status = terminal_status_map[status]
+            if status == 53 and filled_volume > 0:
+                new_status = 'partial_filled_canceled'
+            elif status == 54 and filled_volume >= requested_volume > 0:
+                new_status = 'filled'
+
+            try:
+                if hasattr(self.db, 'update_grid_order'):
+                    self.db.update_grid_order(order_id, {
+                        'status': new_status,
+                        'filled_volume': filled_volume,
+                        'filled_amount': float(pending.get('filled_amount') or 0.0),
+                        'last_error': f'order terminal status {status}'
+                    })
+            except Exception as db_err:
+                logger.error(f"[GRID] handle_order_callback: 更新委托终态失败 order_id={order_id}, err={db_err}")
+                return False
+
+            self.pending_grid_orders.pop(order_id, None)
+            tracker = self.trackers.get(pending.get('session_id'))
+            if tracker:
+                tracker.waiting_callback = False
+                tracker.crossed_level = None
+            self._complete_stop_if_no_open_orders_unlocked(pending.get('session_id'))
+            logger.warning(
+                f"[GRID] handle_order_callback: 委托终态已处理 order_id={order_id}, "
+                f"status={status}, mapped={new_status}, filled={filled_volume}/{requested_volume}"
+            )
+            return True
+
+    def _get_reserved_buy_amount_unlocked(self, session_id: int) -> float:
+        """统计已提交但尚未落账的网格买入预算占用。"""
+        reserved = 0.0
+        for pending in self.pending_grid_orders.values():
+            if pending.get('session_id') == session_id and pending.get('side') == 'BUY':
+                remaining_volume = int(pending.get('requested_volume') or 0) - int(pending.get('filled_volume') or 0)
+                if remaining_volume > 0:
+                    reserved += remaining_volume * float(
+                        pending.get('reserved_price') or pending.get('expected_price') or 0
+                    )
+        for plan in self.submitting_grid_orders.values():
+            if plan.get('session_id') == session_id and plan.get('side') == 'BUY':
+                reserved += int(plan.get('volume') or 0) * float(
+                    plan.get('reserved_price') or plan.get('expected_price') or 0
+                )
+        return reserved
+
+    def _get_reserved_sell_volume_unlocked(self, session_id: int) -> int:
+        """统计已提交但尚未终结的网格卖出数量，避免锁外下单窗口重复卖出。"""
+        reserved = 0
+        for pending in self.pending_grid_orders.values():
+            if pending.get('session_id') == session_id and pending.get('side') == 'SELL':
+                remaining_volume = int(pending.get('requested_volume') or 0) - int(pending.get('filled_volume') or 0)
+                if remaining_volume > 0:
+                    reserved += remaining_volume
+        for plan in self.submitting_grid_orders.values():
+            if plan.get('session_id') == session_id and plan.get('side') == 'SELL':
+                reserved += int(plan.get('volume') or 0)
+        return reserved
+
+    def _create_submit_id(self, session_id: int, side: str) -> str:
+        return f"{session_id}:{side}:{int(time.time() * 1000000)}"
+
+    def _build_grid_order_plan(self, session: GridSession, signal: dict, position_snapshot=None) -> Optional[dict]:
+        """锁内生成下单计划；不调用任何券商接口。"""
+        stock_code = session.stock_code
+        trigger_price = float(signal['trigger_price'])
+        signal_type = signal['signal_type']
+
+        if session.status != 'active':
+            logger.warning(f"[GRID] _build_grid_order_plan: 会话非active, status={session.status}")
+            return None
+
+        if signal_type == 'BUY':
+            if session.max_investment <= 0:
+                logger.error(f"[GRID] _build_grid_order_plan: {stock_code} max_investment无效")
+                return None
+
+            buy_cooldown = getattr(config, 'GRID_BUY_COOLDOWN', 0)
+            if buy_cooldown > 0:
+                elapsed = time.time() - self.last_buy_times.get(session.id, 0)
+                if elapsed < buy_cooldown:
+                    logger.warning(f"[GRID] _build_grid_order_plan: {stock_code} 买入冷却中, 剩余{buy_cooldown - elapsed:.0f}秒")
+                    return None
+
+            reserved_amount = self._get_reserved_buy_amount_unlocked(session.id)
+            effective_investment = session.current_investment + reserved_amount
+            if effective_investment >= session.max_investment:
+                logger.warning(
+                    f"[GRID] _build_grid_order_plan: {stock_code} 达到最大投入限额 "
+                    f"current={session.current_investment:.2f}, reserved={reserved_amount:.2f}, "
+                    f"max={session.max_investment:.2f}"
+                )
+                return None
+
+            remaining_investment = session.max_investment - effective_investment
+            buy_amount = min(remaining_investment, session.max_investment * session.position_ratio)
+            if buy_amount < 100:
+                logger.warning(f"[GRID] _build_grid_order_plan: {stock_code} 可用买入金额{buy_amount:.2f}不足100元")
+                return None
+
+            confirm_by_deal = (
+                not getattr(config, 'ENABLE_SIMULATION_MODE', True)
+                and getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True)
+            )
+            use_counterparty = (
+                getattr(config, 'GRID_USE_COUNTERPARTY_PRICE', True)
+                and confirm_by_deal
+            )
+            reserved_price = self._calculate_buy_reserved_price(
+                stock_code,
+                trigger_price,
+                use_counterparty,
+                latest_price=signal.get('latest_price')
+            )
+            if reserved_price <= 0:
+                logger.warning(f"[GRID] _build_grid_order_plan: {stock_code} 买入风险价无效")
+                return None
+
+            volume = (int(buy_amount / reserved_price) // 100) * 100
+            if volume < 100:
+                logger.warning(
+                    f"[GRID] _build_grid_order_plan: {stock_code} 按风险价{reserved_price:.4f}计算后买入数量{volume}不足100股"
+                )
+                return None
+
+            expected_amount = volume * reserved_price
+            if expected_amount > remaining_investment + 0.01:
+                logger.error(
+                    f"[GRID] _build_grid_order_plan: HARD CAP 阻止超买 amount={expected_amount:.4f}, "
+                    f"remaining={remaining_investment:.4f}, reserved_price={reserved_price:.4f}"
+                )
+                return None
+
+            signal_with_risk = dict(signal)
+            signal_with_risk['reserved_price'] = reserved_price
+
+            return {
+                'submit_id': self._create_submit_id(session.id, 'BUY'),
+                'session_id': session.id,
+                'stock_code': stock_code,
+                'side': 'BUY',
+                'signal': signal_with_risk,
+                'volume': volume,
+                'expected_price': trigger_price,
+                'reserved_price': reserved_price,
+                'order_price': None if use_counterparty else trigger_price,
+                'confirm_by_deal': confirm_by_deal
+            }
+
+        if signal_type == 'SELL':
+            sell_cooldown = getattr(config, 'GRID_SELL_COOLDOWN', 0)
+            if sell_cooldown > 0:
+                last_sell = self.last_sell_times.get(session.id, 0)
+                elapsed = time.time() - last_sell
+                if elapsed < sell_cooldown:
+                    price_threshold = getattr(config, 'GRID_SELL_COOLDOWN_PRICE_THRESHOLD', 0.02)
+                    last_sell_price = self.last_sell_prices.get(session.id, 0)
+                    adaptive_allowed = (
+                        price_threshold > 0 and last_sell_price > 0
+                        and trigger_price > last_sell_price * (1 + price_threshold)
+                        and elapsed >= sell_cooldown // 2
+                    )
+                    if not adaptive_allowed:
+                        logger.warning(f"[GRID] _build_grid_order_plan: {stock_code} 卖出冷却中")
+                        return None
+
+            position = position_snapshot if position_snapshot is not None else self.position_manager.get_position(stock_code)
+            if not position:
+                logger.error(f"[GRID] _build_grid_order_plan: {stock_code} 持仓不存在")
+                return None
+            current_volume = int(position.get('volume', 0) or 0)
+            available_volume = int(position.get('available', current_volume) or 0)
+            if current_volume <= 0 or available_volume <= 0:
+                logger.warning(f"[GRID] _build_grid_order_plan: {stock_code} 无可卖持仓")
+                return None
+
+            reserved_sell = self._get_reserved_sell_volume_unlocked(session.id)
+            effective_available = max(0, available_volume - reserved_sell)
+            if effective_available <= 0:
+                logger.warning(
+                    f"[GRID] _build_grid_order_plan: {stock_code} 可卖数量已被未完成网格卖单占用 "
+                    f"available={available_volume}, reserved={reserved_sell}"
+                )
+                return None
+
+            sell_volume = (int(effective_available * session.position_ratio) // 100) * 100
+            if sell_volume == 0:
+                sell_volume = 100
+            if sell_volume > effective_available:
+                sell_volume = (int(effective_available) // 100) * 100
+            if sell_volume <= 0:
+                logger.warning(f"[GRID] _build_grid_order_plan: {stock_code} 可卖数量不足100股")
+                return None
+
+            confirm_by_deal = (
+                not getattr(config, 'ENABLE_SIMULATION_MODE', True)
+                and getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True)
+            )
+            use_counterparty = (
+                getattr(config, 'GRID_USE_COUNTERPARTY_PRICE', True)
+                and confirm_by_deal
+            )
+            return {
+                'submit_id': self._create_submit_id(session.id, 'SELL'),
+                'session_id': session.id,
+                'stock_code': stock_code,
+                'side': 'SELL',
+                'signal': dict(signal),
+                'volume': sell_volume,
+                'expected_price': trigger_price,
+                'order_price': None if use_counterparty else trigger_price,
+                'confirm_by_deal': confirm_by_deal
+            }
+
+        logger.error(f"[GRID] _build_grid_order_plan: 未知信号类型 {signal_type}")
+        return None
+
+    def _submit_grid_order_outside_lock(self, plan: dict):
+        """锁外调用券商下单接口。"""
+        if plan['side'] == 'BUY':
+            return self.executor.buy_stock(
+                stock_code=plan['stock_code'],
+                volume=plan['volume'],
+                price=plan['order_price'],
+                strategy=config.GRID_STRATEGY_NAME
+            )
+        return self.executor.sell_stock(
+            stock_code=plan['stock_code'],
+            volume=plan['volume'],
+            price=plan['order_price'],
+            strategy=config.GRID_STRATEGY_NAME
+        )
+
+    def _mark_order_accepted_unlocked(self, session: GridSession, plan: dict, trade_id: str) -> bool:
+        """券商已接受委托后，锁内登记 pending 或按旧模式直接落账。"""
+        side = plan['side']
+        if side == 'BUY':
+            self.last_buy_times[session.id] = time.time()
+        else:
+            self.last_sell_times[session.id] = time.time()
+            self.last_sell_prices[session.id] = plan['expected_price']
+
+        if plan.get('confirm_by_deal'):
+            self._register_pending_grid_order(
+                order_id=trade_id,
+                session=session,
+                signal=plan['signal'],
+                side=side,
+                volume=plan['volume'],
+                expected_price=plan['expected_price']
+            )
+            return True
+
+        return self._record_confirmed_grid_trade(
+            session=session,
+            signal=plan['signal'],
+            side=side,
+            price=plan['expected_price'],
+            volume=plan['volume'],
+            trade_id=trade_id
+        )
+
+    def _reset_tracker_after_failed_trade_unlocked(self, session: GridSession, signal_type: str):
+        """交易失败后重置追踪器，等待价格重新穿越。"""
+        tracker = self.trackers.get(session.id)
+        if tracker:
+            tracker.waiting_callback = False
+            tracker.crossed_level = None
+            logger.info(
+                f"[GRID] execute_grid_trade: 交易失败，重置追踪器 waiting_callback=False "
+                f"stock_code={session.stock_code}, signal_type={signal_type}"
+            )
+
     def execute_grid_trade(self, signal: dict) -> bool:
         """
         执行网格交易
@@ -1069,19 +2544,20 @@ class GridTradingManager:
         """
         logger.info(f"[GRID] execute_grid_trade: 开始执行交易 signal={signal}")
 
+        session_id = None
+        signal_type = signal.get('signal_type', '')
+        stock_code = signal.get('stock_code', '')
         try:
-            # RISK-3修复: 在持有 self.lock 之前预取持仓快照。
-            # 若在 with self.lock: 内部再调用 get_position()（→ memory_conn_lock），
-            # 而其他路径（如 check_grid_signals）在持有 memory_conn_lock 时尝试获取 self.lock，
-            # 将形成 AB-BA 死锁。提前获取持仓快照、锁外释放 memory_conn_lock，
-            # 确保两个锁的获取顺序始终单向（memory_conn_lock → self.lock），消除死锁风险。
-            signal_type_early = signal.get('signal_type', '')
-            stock_code_early = signal.get('stock_code', '')
+            # 锁外预取外部依赖，避免在网格全局锁内调用持仓/行情/QMT接口。
             position_snapshot = None
-            if signal_type_early == 'SELL' and stock_code_early:
-                position_snapshot = self.position_manager.get_position(stock_code_early)
-                logger.debug(f"[GRID] execute_grid_trade: RISK-3预取持仓 stock_code={stock_code_early}, "
+            if signal_type == 'SELL' and stock_code:
+                position_snapshot = self.position_manager.get_position(stock_code)
+                logger.debug(f"[GRID] execute_grid_trade: RISK-3预取持仓 stock_code={stock_code}, "
                              f"snapshot={'有持仓' if position_snapshot else '无持仓'}")
+            latest_price = self._get_latest_price_for_signal(stock_code, position_snapshot=position_snapshot) if stock_code else None
+            tradable_result = (True, "")
+            if not config.ENABLE_SIMULATION_MODE and getattr(config, 'GRID_ENABLE_PRICE_LIMIT_GUARD', True):
+                tradable_result = self._check_tradable(stock_code, signal_type, latest_price)
 
             with self.lock:
                 stock_code = signal['stock_code']
@@ -1089,45 +2565,96 @@ class GridTradingManager:
                 if not session:
                     logger.error(f"[GRID] execute_grid_trade: 会话不存在: {stock_code}")
                     return False
+                if not session.enabled:
+                    logger.warning(f"[GRID] execute_grid_trade: 个股网格开关关闭，拒绝执行 stock_code={stock_code}, session_id={session.id}")
+                    return False
 
                 signal_type = signal['signal_type']
+                session_id = session.id
                 trigger_price = signal['trigger_price']
                 logger.debug(f"[GRID] execute_grid_trade: session_id={session.id}, signal_type={signal_type}, trigger_price={trigger_price:.2f}")
 
+                if not self._validate_grid_signal_before_execute(signal, session, latest_price=latest_price):
+                    logger.warning(f"[GRID] execute_grid_trade: 信号复核失败，拒绝执行 stock_code={stock_code}, signal_type={signal_type}")
+                    self._reset_tracker_after_failed_trade_unlocked(session, signal_type)
+                    return False
+
+                tradable, reason = tradable_result
+                if not tradable:
+                    logger.warning(f"[GRID] execute_grid_trade: 涨跌停/停牌防护拦截 "
+                                   f"stock_code={stock_code}, signal_type={signal_type}: {reason}")
+                    self._reset_tracker_after_failed_trade_unlocked(session, signal_type)
+                    return False
+
                 # 执行交易前的状态
+                before_pnl = self.get_pnl_snapshot(
+                    session,
+                    current_price=trigger_price,
+                    position_snapshot=position_snapshot
+                )
                 logger.debug(f"[GRID] execute_grid_trade: 交易前状态 trade_count={session.trade_count}, "
-                            f"current_investment={session.current_investment:.2f}, profit_ratio={session.get_profit_ratio()*100:.2f}%")
+                            f"current_investment={session.current_investment:.2f}, "
+                            f"profit_ratio={before_pnl['profit_ratio']*100:.2f}% "
+                            f"({before_pnl['method_detail']})")
 
-                # 执行交易
-                if signal_type == 'BUY':
-                    logger.debug(f"[GRID] execute_grid_trade: 调用_execute_grid_buy")
-                    success = self._execute_grid_buy(session, signal)
-                elif signal_type == 'SELL':
-                    logger.debug(f"[GRID] execute_grid_trade: 调用_execute_grid_sell")
-                    success = self._execute_grid_sell(session, signal, position_snapshot=position_snapshot)
-                else:
-                    logger.error(f"[GRID] execute_grid_trade: 未知信号类型: {signal_type}")
+                signal_for_plan = dict(signal)
+                if latest_price is not None:
+                    signal_for_plan['latest_price'] = latest_price
+                plan = self._build_grid_order_plan(session, signal_for_plan, position_snapshot=position_snapshot)
+                if not plan:
+                    logger.warning(f"[GRID] execute_grid_trade: 生成下单计划失败 stock_code={stock_code}, signal_type={signal_type}")
+                    self._reset_tracker_after_failed_trade_unlocked(session, signal_type)
                     return False
 
-                if not success:
+                self.submitting_grid_orders[plan['submit_id']] = plan
+
+            # 真正下单发生在锁外，避免QMT卡顿阻塞网格状态机。
+            if config.ENABLE_SIMULATION_MODE:
+                trade_id = f"GRID_SIM_{plan['side']}_{int(time.time()*1000)}"
+                result = trade_id
+            else:
+                result = self._submit_grid_order_outside_lock(plan)
+                if not result:
+                    logger.error(f"[GRID] execute_grid_trade: 实盘网格{plan['side']}下单失败: {plan['stock_code']}")
+                    result = None
+                trade_id = self._extract_order_id(result)
+
+            cancel_after_accept = None
+            with self.lock:
+                current_plan = self.submitting_grid_orders.pop(plan['submit_id'], plan)
+                session = self._find_session_by_id(plan['session_id'])
+                if not session:
+                    logger.warning(f"[GRID] execute_grid_trade: 下单返回后会话已不存在 submit_id={plan['submit_id']}")
+                    return False
+
+                if not result or (plan.get('confirm_by_deal') and not trade_id):
                     logger.warning(f"[GRID] execute_grid_trade: 交易执行失败 stock_code={stock_code}, signal_type={signal_type}")
-                    # 修复：买入/卖出失败时重置追踪器 waiting_callback 状态。
-                    # 问题：失败时 tracker.waiting_callback 仍为 True，导致每 3 秒重新生成相同
-                    #       信号，信号被 P1-2 清除后再次生成，形成无限重试死循环。
-                    # 修复：失败后将追踪器重置为"等待穿越"状态，要求价格重新穿越档位才能触发新信号。
-                    tracker = self.trackers.get(session.id)
-                    if tracker:
-                        tracker.waiting_callback = False
-                        tracker.crossed_level = None
-                        logger.info(f"[GRID] execute_grid_trade: 交易失败，重置追踪器 waiting_callback=False "
-                                    f"stock_code={stock_code}, signal_type={signal_type}")
+                    self._reset_tracker_after_failed_trade_unlocked(session, signal_type)
+                    self._complete_stop_if_no_open_orders_unlocked(session.id)
                     return False
 
-                # A-2修复: 冷却键改用 signal['grid_level']（触发信号的实际档位价格）
-                # 问题根因: 原来用初始中心价计算固定档位作为冷却键，但 _check_level_crossing 读键时
-                # 每次重新用 current_center_price（交易后已更新）计算档位，两侧键值不一致，冷却完全失效。
-                # 修复方案: 读写两侧统一使用 signal['grid_level']（即 tracker.crossed_level，穿越时的实际档位价格），
-                # 这是两侧唯一共享的精确键值，与 _check_level_crossing 写 tracker.crossed_level 的时机一致。
+                success = self._mark_order_accepted_unlocked(session, plan, trade_id)
+                if not success:
+                    logger.warning(f"[GRID] execute_grid_trade: 交易落账/登记失败 stock_code={stock_code}, signal_type={signal_type}")
+                    self._reset_tracker_after_failed_trade_unlocked(session, signal_type)
+                    self._complete_stop_if_no_open_orders_unlocked(session.id)
+                    return False
+
+                if session.status == 'stopping' or current_plan.get('stop_requested'):
+                    pending = self.pending_grid_orders.get(str(trade_id))
+                    if pending:
+                        pending['stop_requested'] = True
+                        pending['stop_reason'] = session.stop_reason or current_plan.get('stop_reason')
+                        cancel_after_accept = str(trade_id)
+                        try:
+                            if hasattr(self.db, 'update_grid_order'):
+                                self.db.update_grid_order(cancel_after_accept, {
+                                    'status': 'cancel_requested',
+                                    'last_error': f"stop requested: {pending.get('stop_reason')}"
+                                })
+                        except Exception as db_err:
+                            logger.warning(f"[GRID] execute_grid_trade: 下单后标记撤单请求失败 order_id={trade_id}, err={db_err}")
+
                 cooldown_level = signal.get('grid_level')
                 if cooldown_level is not None:
                     cooldown_key = (session.id, cooldown_level)
@@ -1139,14 +2666,36 @@ class GridTradingManager:
                     logger.warning(f"[GRID] execute_grid_trade: signal 中无 grid_level，跳过冷却设置")
 
                 # 执行交易后的状态
+                after_pnl = self.get_pnl_snapshot(
+                    session,
+                    current_price=trigger_price,
+                    position_snapshot=position_snapshot
+                )
                 logger.debug(f"[GRID] execute_grid_trade: 交易后状态 trade_count={session.trade_count}, "
-                            f"current_investment={session.current_investment:.2f}, profit_ratio={session.get_profit_ratio()*100:.2f}%")
+                            f"current_investment={session.current_investment:.2f}, "
+                            f"profit_ratio={after_pnl['profit_ratio']*100:.2f}% "
+                            f"({after_pnl['method_detail']})")
 
                 # 触发数据版本更新
                 self.position_manager._increment_data_version()
 
                 logger.info(f"[GRID] execute_grid_trade: 交易执行成功 stock_code={stock_code}, signal_type={signal_type}")
-                return True
+
+                if not self.pending_grid_orders.get(str(trade_id)):
+                    self._complete_stop_if_no_open_orders_unlocked(session.id)
+
+            if cancel_after_accept:
+                if not self._cancel_grid_order(cancel_after_accept):
+                    with self.lock:
+                        try:
+                            if hasattr(self.db, 'update_grid_order'):
+                                self.db.update_grid_order(cancel_after_accept, {
+                                    'status': 'cancel_failed',
+                                    'last_error': 'cancel failed after stop requested'
+                                })
+                        except Exception as db_err:
+                            logger.warning(f"[GRID] execute_grid_trade: 写入撤单失败状态失败 order_id={cancel_after_accept}, err={db_err}")
+            return True
 
         except Exception as e:
             logger.error(f"[GRID] execute_grid_trade: 执行网格交易失败: {str(e)}", exc_info=True)
@@ -1154,17 +2703,16 @@ class GridTradingManager:
             # 若不重置，任何 DB/网络异常都会导致 tracker.waiting_callback 留在 True，
             # 重现无限重试死循环。
             try:
+                if 'plan' in locals() and isinstance(plan, dict) and plan.get('submit_id'):
+                    with self.lock:
+                        self.submitting_grid_orders.pop(plan['submit_id'], None)
                 stock_code_for_reset = signal.get('stock_code', '')
                 if stock_code_for_reset:
                     with self.lock:
                         session_for_reset = self.sessions.get(self._normalize_code(stock_code_for_reset))
                         if session_for_reset:
-                            tracker_for_reset = self.trackers.get(session_for_reset.id)
-                            if tracker_for_reset:
-                                tracker_for_reset.waiting_callback = False
-                                tracker_for_reset.crossed_level = None
-                                logger.info(f"[GRID] execute_grid_trade: 异常后重置追踪器 "
-                                            f"stock_code={stock_code_for_reset}")
+                            self._reset_tracker_after_failed_trade_unlocked(session_for_reset, signal.get('signal_type', ''))
+                            self._complete_stop_if_no_open_orders_unlocked(session_for_reset.id)
             except Exception as reset_err:
                 logger.warning(f"[GRID] execute_grid_trade: 异常路径重置追踪器失败(可忽略): {reset_err}")
             return False
@@ -1250,13 +2798,22 @@ class GridTradingManager:
             # ── V1 修复：明确传入 volume+price，避免 executor 用市价重算量 ──────────────
             # 若只传 amount，executor 会用实时市价重算股数，当计算量≤0时强制设100股，
             # 可能导致实际下单金额远超 actual_amount（例如剩余50元却下了100股×市价的单）。
-            # 解决方案：直接传 volume 和 trigger_price，QMT 按指定价格下限价单。
+            # 解决方案：直接传 volume，价格按 order_price 下限价单。
+            #
+            # 对手价模式(GRID_USE_COUNTERPARTY_PRICE)：price=None 时 executor 自动取卖三价，
+            # 提高成交概率(参考动态止盈下单逻辑)。仅在成交确认模式下启用——落账以真实成交价
+            # 为准(handle_deal_callback)，volume 与硬上限以 trigger_price 估算、deal 回报修正。
+            use_counterparty = (
+                getattr(config, 'GRID_USE_COUNTERPARTY_PRICE', True)
+                and getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True)
+            )
+            order_price = None if use_counterparty else trigger_price
             logger.debug(f"[GRID] _execute_grid_buy: 调用executor.buy_stock 实盘买入 "
-                         f"volume={volume}, price={trigger_price:.2f}")
+                         f"volume={volume}, price={'卖三价(对手价)' if order_price is None else f'{order_price:.2f}'}")
             result = self.executor.buy_stock(
                 stock_code=stock_code,
                 volume=volume,
-                price=trigger_price,
+                price=order_price,
                 strategy=config.GRID_STRATEGY_NAME
             )
             if not result:
@@ -1264,6 +2821,26 @@ class GridTradingManager:
                 return False
             trade_id = self._extract_order_id(result)
             logger.info(f"[GRID] _execute_grid_buy: 实盘网格买入成功: {stock_code}, trade_id={trade_id}")
+
+            if getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True):
+                if not trade_id:
+                    logger.error(f"[GRID] _execute_grid_buy: 实盘委托成功但缺少order_id，无法等待成交确认: {stock_code}")
+                    return False
+                self.last_buy_times[session.id] = time.time()
+                logger.debug(f"[GRID] _execute_grid_buy: 实盘委托已登记冷却 last_buy_times[{session.id}]")
+                self._register_pending_grid_order(
+                    order_id=trade_id,
+                    session=session,
+                    signal=signal,
+                    side='BUY',
+                    volume=volume,
+                    expected_price=trigger_price
+                )
+                logger.info(
+                    f"[GRID] _execute_grid_buy: 实盘网格买入委托已提交，等待成交回调确认 "
+                    f"stock_code={stock_code}, order_id={trade_id}, volume={volume}, price={trigger_price:.2f}"
+                )
+                return True
 
         # BUG-C1修复: 下单成功后立即记录冷却时间，防止DB写入失败时重复下单。
         # 背景: 原逻辑将 last_buy_times 更新置于 DB 写入成功之后（函数末尾）。
@@ -1275,85 +2852,18 @@ class GridTradingManager:
         self.last_buy_times[session.id] = time.time()
         logger.debug(f"[GRID] _execute_grid_buy: BUG-C1修复 last_buy_times[{session.id}]已记录(DB写入前)")
 
-        # 4. 更新会话统计
-        old_trade_count = session.trade_count
-        old_buy_count = session.buy_count
-        old_total_buy = session.total_buy_amount
-        old_total_buy_vol = session.total_buy_volume
-        old_investment = session.current_investment
-
-        session.trade_count += 1
-        session.buy_count += 1
-        session.total_buy_amount += actual_amount
-        session.total_buy_volume += volume
-        session.current_investment += actual_amount
-
-        # ── 后置兜底校验（V3）：确保累加后不超限 ─────────────────────────────────────
-        # 理论上 actual_amount <= remaining 已在前置校验保证，此处作最后一道防线。
-        if session.current_investment > session.max_investment + 0.01:
-            logger.error(
-                f"[GRID] _execute_grid_buy: POST-UPDATE HARD CAP: "
-                f"current_investment={session.current_investment:.4f} > max_investment={session.max_investment:.4f}，"
-                f"强制修正至 max_investment（订单已下出，此次为记录修正）"
-            )
-            session.current_investment = session.max_investment
-
-        logger.debug(f"[GRID] _execute_grid_buy: 更新会话统计 trade_count {old_trade_count}->{session.trade_count}, "
-                    f"buy_count {old_buy_count}->{session.buy_count}, "
-                    f"total_buy {old_total_buy:.2f}->{session.total_buy_amount:.2f}, "
-                    f"buy_vol {old_total_buy_vol}->{session.total_buy_volume}, "
-                    f"investment {old_investment:.2f}->{session.current_investment:.2f}")
-
-        # 5. 记录交易
-        trade_data = {
-            'session_id': session.id,
-            'stock_code': stock_code,
-            'trade_type': 'BUY',
-            'grid_level': signal['grid_level'],
-            'trigger_price': trigger_price,
-            'volume': volume,
-            'amount': actual_amount,
-            'valley_price': signal.get('valley_price'),
-            'callback_ratio': round(signal.get('callback_ratio'), 4) if signal.get('callback_ratio') else None,  # 保留4位小数
-            'trade_id': trade_id,
-            'trade_time': datetime.now().isoformat(),
-            'grid_center_before': session.current_center_price,
-            'grid_center_after': trigger_price
-        }
-        logger.debug(f"[GRID] _execute_grid_buy: 记录交易 trade_data={trade_data}")
-        # RISK-1修复：DB写入失败时回滚内存状态，保持内存与DB一致
-        # old_trade_count/old_buy_count/old_total_buy/old_investment 已在第4步保存
-        try:
-            self.db.record_grid_trade(trade_data)
-
-            # 6. 更新数据库会话
-            logger.debug(f"[GRID] _execute_grid_buy: 更新数据库会话")
-            self.db.update_grid_session(session.id, {
-                'trade_count': session.trade_count,
-                'buy_count': session.buy_count,
-                'total_buy_amount': session.total_buy_amount,
-                'total_buy_volume': session.total_buy_volume,
-                'current_investment': session.current_investment
-            })
-        except Exception as db_err:
-            logger.error(f"[GRID] _execute_grid_buy: DB写入失败，回滚内存统计以保持数据一致: {db_err}")
-            session.trade_count = old_trade_count
-            session.buy_count = old_buy_count
-            session.total_buy_amount = old_total_buy
-            session.total_buy_volume = old_total_buy_vol
-            session.current_investment = old_investment
-            return False
-
-        # 7. 重建网格
-        logger.debug(f"[GRID] _execute_grid_buy: 重建网格")
-        self._rebuild_grid(session, trigger_price)
-
-        # (BUG-C1修复: last_buy_times 已在订单确认后立即记录，此处无需重复)
-
-        logger.info(f"[GRID] _execute_grid_buy: 网格买入成功! stock_code={stock_code}, volume={volume}, amount={actual_amount:.2f}, "
-                   f"investment={session.current_investment:.2f}/{session.max_investment:.2f}, trade_id={trade_id}")
-
-        return True
+        success = self._record_confirmed_grid_trade(
+            session=session,
+            signal=signal,
+            side='BUY',
+            price=trigger_price,
+            volume=volume,
+            trade_id=trade_id
+        )
+        if success:
+            logger.info(f"[GRID] _execute_grid_buy: 网格买入成功! stock_code={stock_code}, volume={volume}, amount={actual_amount:.2f}, "
+                       f"investment={session.current_investment:.2f}/{session.max_investment:.2f}, trade_id={trade_id}")
+        return success
 
     def _execute_grid_sell(self, session: GridSession, signal: dict, position_snapshot=None) -> bool:
         """执行网格卖出
@@ -1375,9 +2885,30 @@ class GridTradingManager:
             last_sell = self.last_sell_times.get(session.id, 0)
             elapsed = time.time() - last_sell
             if elapsed < sell_cooldown:
-                logger.warning(f"[GRID] _execute_grid_sell: {stock_code} 卖出冷却中 "
-                               f"(剩余{sell_cooldown - elapsed:.0f}秒), 跳过卖出")
-                return False
+                # 自适应缩短：单边上涨行情中触发价明显高于上次成交价时，冷却期减半
+                price_threshold = getattr(config, 'GRID_SELL_COOLDOWN_PRICE_THRESHOLD', 0.02)
+                last_sell_price = self.last_sell_prices.get(session.id, 0)
+                if (price_threshold > 0 and last_sell_price > 0
+                        and trigger_price > last_sell_price * (1 + price_threshold)):
+                    effective_cooldown = sell_cooldown // 2
+                    if elapsed < effective_cooldown:
+                        logger.warning(
+                            f"[GRID] _execute_grid_sell: {stock_code} 卖出冷却中（自适应缩短至{effective_cooldown}秒）"
+                            f" 剩余{effective_cooldown - elapsed:.0f}秒, "
+                            f"触发价={trigger_price:.2f} 上次={last_sell_price:.2f} "
+                            f"涨幅={(trigger_price/last_sell_price - 1)*100:.1f}%")
+                        return False
+                    else:
+                        logger.info(
+                            f"[GRID] _execute_grid_sell: {stock_code} 自适应冷却缩短生效 "
+                            f"原{sell_cooldown}s→{effective_cooldown}s, "
+                            f"触发价={trigger_price:.2f} 上次={last_sell_price:.2f} "
+                            f"涨幅={(trigger_price/last_sell_price - 1)*100:.1f}%, "
+                            f"已过{elapsed:.0f}s≥{effective_cooldown}s, 允许执行")
+                else:
+                    logger.warning(f"[GRID] _execute_grid_sell: {stock_code} 卖出冷却中 "
+                                   f"(剩余{sell_cooldown - elapsed:.0f}秒), 跳过卖出")
+                    return False
 
         # 1. 获取当前持仓（优先使用调用方预取的快照，避免在持有 self.lock 时再次获取锁）
         position = position_snapshot if position_snapshot is not None else self.position_manager.get_position(stock_code)
@@ -1434,16 +2965,23 @@ class GridTradingManager:
             trade_id = f"GRID_SIM_SELL_{int(time.time()*1000)}"
             logger.info(f"[GRID] _execute_grid_sell: [模拟]网格卖出: {stock_code}, 数量={sell_volume}, 价格={trigger_price:.2f}, trade_id={trade_id}")
         else:
-            # V1-SELL修复: 卖出同样传入 price=trigger_price，与买入 V1 修复对称。
-            # 若不传 price，executor 使用买三价（市价）成交，实际成交价可能偏离 trigger_price，
-            # 导致 sell_amount = sell_volume * trigger_price 与实际成交金额不一致，
-            # current_investment 回收额偏差累积，profit_ratio 统计失真。
+            # V1-SELL修复: 卖出明确传入 volume，避免 executor 用市价重算量。
+            #
+            # 对手价模式(GRID_USE_COUNTERPARTY_PRICE)：price=None 时 executor 自动取买三价，
+            # 提高成交概率(参考动态止盈下单逻辑)。仅在成交确认模式下启用——落账以真实成交价
+            # 为准(handle_deal_callback)，current_investment 回收额按 deal 回报精确统计，不失真。
+            # 非确认模式下回退 trigger_price 限价，保持 V1-SELL 统计一致性。
+            use_counterparty = (
+                getattr(config, 'GRID_USE_COUNTERPARTY_PRICE', True)
+                and getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True)
+            )
+            order_price = None if use_counterparty else trigger_price
             logger.debug(f"[GRID] _execute_grid_sell: 调用executor.sell_stock 实盘卖出 "
-                         f"volume={sell_volume}, price={trigger_price:.2f}")
+                         f"volume={sell_volume}, price={'买三价(对手价)' if order_price is None else f'{order_price:.2f}'}")
             result = self.executor.sell_stock(
                 stock_code=stock_code,
                 volume=sell_volume,
-                price=trigger_price,
+                price=order_price,
                 strategy=config.GRID_STRATEGY_NAME
             )
             if not result:
@@ -1452,87 +2990,48 @@ class GridTradingManager:
             trade_id = self._extract_order_id(result)
             logger.info(f"[GRID] _execute_grid_sell: 实盘网格卖出成功: {stock_code}, trade_id={trade_id}")
 
+            if getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True):
+                if not trade_id:
+                    logger.error(f"[GRID] _execute_grid_sell: 实盘委托成功但缺少order_id，无法等待成交确认: {stock_code}")
+                    return False
+                self.last_sell_times[session.id] = time.time()
+                self.last_sell_prices[session.id] = trigger_price
+                logger.debug(f"[GRID] _execute_grid_sell: 实盘委托已登记冷却 last_sell_times[{session.id}]")
+                self._register_pending_grid_order(
+                    order_id=trade_id,
+                    session=session,
+                    signal=signal,
+                    side='SELL',
+                    volume=sell_volume,
+                    expected_price=trigger_price
+                )
+                logger.info(
+                    f"[GRID] _execute_grid_sell: 实盘网格卖出委托已提交，等待成交回调确认 "
+                    f"stock_code={stock_code}, order_id={trade_id}, volume={sell_volume}, price={trigger_price:.2f}"
+                )
+                return True
+
         # A-4修复（BUG-C1对称）: 下单成功后立即记录卖出冷却时间，防止DB写入失败时重复下单。
         # 与买入 BUG-C1 修复完全对称：即使后续 DB 操作抛出异常并回滚内存统计，
         # GRID_SELL_COOLDOWN 保护依然有效，阻止在冷却期内再次触发卖出。
         self.last_sell_times[session.id] = time.time()
+        self.last_sell_prices[session.id] = trigger_price  # 记录触发价，供自适应冷却缩短使用
         logger.debug(f"[GRID] _execute_grid_sell: A-4修复 last_sell_times[{session.id}]已记录(DB写入前)")
 
-        # 4. 更新会话统计
-        old_trade_count = session.trade_count
-        old_sell_count = session.sell_count
-        old_total_sell = session.total_sell_amount
-        old_total_sell_vol = session.total_sell_volume
-        old_investment = session.current_investment
-
-        session.trade_count += 1
-        session.sell_count += 1
-        session.total_sell_amount += sell_amount
-        session.total_sell_volume += sell_volume
-        # A-1修复: 卖出后按实际成交价（trigger_price）回收资金，而非按成本价（cost_price）。
-        # 原因：current_investment 代表"已占用的资金额度"（以买入成交额累加），
-        # 卖出时释放额度应以实际成交额为准（sell_amount = sell_volume * trigger_price），
-        # 按成本价回收会导致额度与实际现金流不一致：
-        #   - 盈利卖出时：回收额偏低 → current_investment 偏高 → 可用额度被低估（偏保守但有信息误差）
-        #   - 亏损卖出时：回收额偏高 → current_investment 偏低 → V3 硬上限仍兜底，但中间状态不准确
-        # 使用 sell_amount（即已计算好的 sell_volume * trigger_price）直接回收，语义精确。
-        session.current_investment = max(0, session.current_investment - sell_amount)
-
-        logger.debug(f"[GRID] _execute_grid_sell: 更新会话统计 trade_count {old_trade_count}->{session.trade_count}, "
-                    f"sell_count {old_sell_count}->{session.sell_count}, "
-                    f"total_sell {old_total_sell:.2f}->{session.total_sell_amount:.2f}, "
-                    f"sell_vol {old_total_sell_vol}->{session.total_sell_volume}, "
-                    f"investment {old_investment:.2f}->{session.current_investment:.2f}, recovered={sell_amount:.2f}(trigger_price×vol)")
-
-        # 5. 记录交易
-        trade_data = {
-            'session_id': session.id,
-            'stock_code': stock_code,
-            'trade_type': 'SELL',
-            'grid_level': signal['grid_level'],
-            'trigger_price': trigger_price,
-            'volume': sell_volume,
-            'amount': sell_amount,
-            'peak_price': signal.get('peak_price'),
-            'callback_ratio': round(signal.get('callback_ratio'), 4) if signal.get('callback_ratio') else None,  # 保留4位小数
-            'trade_id': trade_id,
-            'trade_time': datetime.now().isoformat(),
-            'grid_center_before': session.current_center_price,
-            'grid_center_after': trigger_price
-        }
-        logger.debug(f"[GRID] _execute_grid_sell: 记录交易 trade_data={trade_data}")
-        # RISK-2修复：DB写入失败时回滚内存状态，防止内存中资金已回收但DB无记录
-        # old_trade_count/old_sell_count/old_total_sell/old_investment 已在第4步保存
-        try:
-            self.db.record_grid_trade(trade_data)
-
-            # 6. 更新数据库会话
-            logger.debug(f"[GRID] _execute_grid_sell: 更新数据库会话")
-            self.db.update_grid_session(session.id, {
-                'trade_count': session.trade_count,
-                'sell_count': session.sell_count,
-                'total_sell_amount': session.total_sell_amount,
-                'total_sell_volume': session.total_sell_volume,
-                'current_investment': session.current_investment
-            })
-        except Exception as db_err:
-            logger.error(f"[GRID] _execute_grid_sell: DB写入失败，回滚内存统计以保持数据一致: {db_err}")
-            session.trade_count = old_trade_count
-            session.sell_count = old_sell_count
-            session.total_sell_amount = old_total_sell
-            session.total_sell_volume = old_total_sell_vol
-            session.current_investment = old_investment
-            return False
-
-        # 7. 重建网格
-        logger.debug(f"[GRID] _execute_grid_sell: 重建网格")
-        self._rebuild_grid(session, trigger_price)
-
-        profit = session.get_profit_ratio()
-        logger.info(f"[GRID] _execute_grid_sell: 网格卖出成功! stock_code={stock_code}, volume={sell_volume}, amount={sell_amount:.2f}, "
-                   f"profit={profit*100:.2f}%, trade_id={trade_id}")
-
-        return True
+        success = self._record_confirmed_grid_trade(
+            session=session,
+            signal=signal,
+            side='SELL',
+            price=trigger_price,
+            volume=sell_volume,
+            trade_id=trade_id
+        )
+        if success:
+            pnl_snapshot = self.get_pnl_snapshot(session, current_price=trigger_price)
+            logger.info(f"[GRID] _execute_grid_sell: 网格卖出成功! stock_code={stock_code}, volume={sell_volume}, amount={sell_amount:.2f}, "
+                       f"profit={pnl_snapshot['profit_ratio']*100:.2f}% "
+                       f"({pnl_snapshot['method_detail']}), trade_id={trade_id}")
+        return success
 
     def get_session_stats(self, session_id: int) -> dict:
         """获取会话统计信息"""
@@ -1545,21 +3044,37 @@ class GridTradingManager:
         if not session:
             return {}
 
+        mark_price = session.current_center_price or session.center_price
+        ledger_summary = None
+        if hasattr(self.db, 'get_grid_ledger_summary'):
+            try:
+                ledger_summary = self.db.get_grid_ledger_summary(session.id, mark_price)
+            except Exception as e:
+                logger.debug(f"[GRID] get_session_stats: 获取账本摘要失败 session_id={session_id}, err={e}")
+        pnl_snapshot = self.get_pnl_snapshot(
+            session,
+            current_price=mark_price,
+            ledger_summary=ledger_summary
+        )
+
         return {
             'session_id': session.id,
             'stock_code': session.stock_code,
             'status': session.status,
+            'enabled': session.enabled,
             'center_price': session.center_price,
             'current_center_price': session.current_center_price,
             'grid_levels': session.get_grid_levels(),
             'trade_count': session.trade_count,
             'buy_count': session.buy_count,
             'sell_count': session.sell_count,
-            'profit_ratio': session.get_profit_ratio(),
-            'grid_profit': session.get_grid_profit(),
+            'profit_ratio': pnl_snapshot['profit_ratio'],
+            'grid_profit': pnl_snapshot['total_pnl'],
+            'pnl_snapshot': pnl_snapshot,
             'deviation_ratio': session.get_deviation_ratio(),
             'current_investment': session.current_investment,
             'max_investment': session.max_investment,
+            'ledger_summary': ledger_summary,
             'start_time': session.start_time.isoformat() if session.start_time else None,
             'end_time': session.end_time.isoformat() if session.end_time else None
         }

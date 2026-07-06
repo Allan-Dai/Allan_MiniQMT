@@ -29,6 +29,16 @@ except Exception:
     import logging
     logger = logging.getLogger("xtquant_manager.account")
 
+try:
+    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+    from xtquant.xttype import StockAccount
+    _XTQUANT_AVAILABLE = True
+except ImportError:
+    XtQuantTrader = None
+    XtQuantTraderCallback = None
+    StockAccount = None
+    _XTQUANT_AVAILABLE = False
+
 
 @dataclass
 class AccountConfig:
@@ -39,10 +49,11 @@ class AccountConfig:
     session_id: Optional[int] = None          # None = 随机生成
     call_timeout: float = 3.0                  # 普通调用超时
     download_timeout: float = 30.0             # 历史数据下载超时
+    connect_timeout: float = 30.0              # xttrader.connect() 超时保护（秒）
     reconnect_base_wait: float = 60.0          # 重连基础等待（秒）
     max_reconnect_attempts: int = 5             # 最大重连次数（超过后仍重试但不计次）
     ping_stock: str = "000001.SZ"              # 心跳探测使用的股票代码
-    ping_staleness_threshold: float = 300.0    # 超过此秒数未成功 ping，is_healthy() 返回 False
+    ping_staleness_threshold: float = 300.0    # 超过此秒数未成功 ping，触发例行真实探测
 
 
 class XtQuantAccount:
@@ -81,6 +92,12 @@ class XtQuantAccount:
 
         # 外部成交回调列表
         self._trade_callbacks: List[Any] = []
+
+        # 外部断连回调列表（on_disconnected 触发时调用）
+        self._disconnect_callbacks: List[Any] = []
+
+        # 重连中断事件：disconnect() 调用时 set()，允许 reconnect() 提前退出等待
+        self._reconnect_abort = threading.Event()
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -140,11 +157,12 @@ class XtQuantAccount:
             return False
 
     def _connect_xttrader(self) -> bool:
-        """连接 xttrader 交易接口"""
+        """连接 xttrader 交易接口（含超时保护，参照 easy_qmt_trader.py:314-340）"""
+        if not _XTQUANT_AVAILABLE:
+            logger.warning(f"[{self._id()}] xtquant 未安装，xttrader 不可用")
+            return False
+        xt_trader = None
         try:
-            from xtquant.xttrader import XtQuantTrader
-            from xtquant.xttype import StockAccount
-
             session_id = self.config.session_id
             if session_id is None:
                 session_id = random.randint(100000, 999999)
@@ -159,34 +177,96 @@ class XtQuantAccount:
             self._setup_callbacks(xt_trader)
 
             xt_trader.start()
-            connect_result = xt_trader.connect()
 
+            # ── 超时保护：在独立线程中调用 connect()，防止 QMT 未启动时永久阻塞 ──
+            connect_result_holder = [None]
+            connect_error_holder = [None]
+
+            def _do_connect():
+                try:
+                    connect_result_holder[0] = xt_trader.connect()
+                except Exception as e:
+                    connect_error_holder[0] = e
+
+            connect_thread = threading.Thread(target=_do_connect, daemon=True)
+            connect_thread.start()
+            connect_thread.join(self.config.connect_timeout)
+
+            if connect_thread.is_alive():
+                logger.error(
+                    f"[{self._id()}] xttrader.connect() 超时 "
+                    f"({self.config.connect_timeout}s)，中止连接"
+                )
+                try:
+                    xt_trader.stop()
+                except Exception:
+                    pass
+                return False
+
+            if connect_error_holder[0] is not None:
+                logger.error(
+                    f"[{self._id()}] xttrader.connect() 异常: "
+                    f"{connect_error_holder[0]}"
+                )
+                try:
+                    xt_trader.stop()
+                except Exception:
+                    pass
+                return False
+            # ── 超时保护结束 ──
+
+            connect_result = connect_result_holder[0]
             if connect_result == 0:
                 subscribe_result = xt_trader.subscribe(acc)
-                logger.info(f"[{self._id()}] xttrader 连接成功, 订阅结果={subscribe_result}")
+                logger.info(
+                    f"[{self._id()}] xttrader 连接成功, "
+                    f"订阅结果={subscribe_result}"
+                )
                 self._xt_trader = xt_trader
                 self._acc = acc
                 return True
             else:
-                logger.error(f"[{self._id()}] xttrader 连接失败, 结果={connect_result}")
+                logger.error(
+                    f"[{self._id()}] xttrader 连接失败, 结果={connect_result}"
+                )
+                try:
+                    xt_trader.stop()
+                except Exception:
+                    pass
                 return False
 
-        except ImportError:
-            logger.warning(f"[{self._id()}] xtquant 未安装，xttrader 不可用")
-            return False
         except Exception as e:
             logger.error(f"[{self._id()}] xttrader 连接异常: {e}")
+            if xt_trader is not None:
+                try:
+                    xt_trader.stop()
+                except Exception:
+                    pass
             return False
 
     def _setup_callbacks(self, xt_trader) -> None:
-        """注册交易回调"""
+        """注册交易回调和断连回调"""
         try:
-            from xtquant.xttrader import XtQuantTraderCallback
+            if XtQuantTraderCallback is None:
+                return
 
             class _Callback(XtQuantTraderCallback):
                 def __init__(self_cb, account_obj):
                     super().__init__()
                     self_cb._account = account_obj
+
+                def on_disconnected(self_cb):
+                    """
+                    QMT 进程崩溃或网络中断时由 xtquant 主动回调。
+                    立即更新连接状态，无需等待 HealthMonitor 轮询（快则 <1s）。
+                    参照 easy_qmt_trader.py:31-42 的已验证实现。
+                    """
+                    acct = self_cb._account
+                    logger.error(
+                        f"[{acct._id()}] QMT 连接断开（on_disconnected），"
+                        f"立即重置连接状态"
+                    )
+                    acct._on_disconnect_event()
 
                 def on_stock_trade(self_cb, trade):
                     for cb in self_cb._account._trade_callbacks:
@@ -201,7 +281,8 @@ class XtQuantAccount:
             logger.warning(f"[{self._id()}] 注册回调异常: {e}")
 
     def disconnect(self) -> None:
-        """断开连接，释放资源"""
+        """断开连接，释放资源。若有重连在等待中，立即中断。"""
+        self._reconnect_abort.set()  # 中断任何正在等待的 reconnect()
         with self._conn_lock:
             self._connected = False
             if self._xt_trader is not None:
@@ -235,7 +316,9 @@ class XtQuantAccount:
                 f"[{self._id()}] 等待 {wait:.0f}s 后重连 "
                 f"(第 {self._reconnect_attempts + 1} 次)"
             )
-            time.sleep(wait)
+            # 清除旧的 abort 信号，再等待（防止被上次 disconnect() 的遗留信号立即跳过）
+            self._reconnect_abort.clear()
+            self._reconnect_abort.wait(wait)  # 可被 disconnect() 立即中断
 
             # 先断开旧连接
             with self._conn_lock:
@@ -273,16 +356,28 @@ class XtQuantAccount:
         """
         快速内存检查（无 I/O）。
 
-        除基础的 _connected 和 _xt_trader 标志外，还检查 ping 时效：
-        若 _last_ping_ok_time 超过 ping_staleness_threshold 秒未刷新，
-        返回 False 强制触发 Level 1 ping()，从而探测到 QMT 进程崩溃等隐性断连。
+        这里只判断连接对象和连接标志是否处于可用状态，不把 ping 过期当作
+        “不健康”。ping 过期只表示需要做一次例行真实探测，由 needs_ping()
+        单独表达，避免健康账号每 5 分钟产生一次误导性的 Level 0 失败日志。
         """
         if not self._connected or self._xt_trader is None:
             return False
         if self._last_ping_ok_time is None:
             return False
+        return True
+
+    def needs_ping(self) -> bool:
+        """
+        是否需要执行例行真实探测。
+
+        该方法只用于 HealthMonitor 的正常巡检路径：连接状态仍健康，但距离
+        上次 ping 成功已经超过阈值，需要主动探测 xtdata + xttrader，及时发现
+        QMT 进程崩溃、xttrader 隐性断连等问题。
+        """
+        if not self.is_healthy():
+            return False
         elapsed = time.time() - self._last_ping_ok_time
-        return elapsed <= self.config.ping_staleness_threshold
+        return elapsed >= self.config.ping_staleness_threshold
 
     def ping(self) -> bool:
         """
@@ -342,6 +437,18 @@ class XtQuantAccount:
             self._xtdata.get_full_tick,
             stock_codes,
             op="get_full_tick",
+            default={},
+        )
+
+    def get_instrument_detail(self, stock_code: str) -> dict:
+        """获取证券信息（含名称），失败返回空 dict。
+        xtdata 本地缓存调用，无网络开销。"""
+        if self._xtdata is None:
+            return {}
+        return self._call(
+            self._xtdata.get_instrument_detail,
+            stock_code,
+            op="get_instrument_detail",
             default={},
         )
 
@@ -560,6 +667,32 @@ class XtQuantAccount:
         """注册成交回调，连接后触发"""
         self._trade_callbacks.append(cb)
 
+    def register_disconnect_callback(self, cb) -> None:
+        """
+        注册断连事件回调。
+        QMT 连接断开时（on_disconnected 触发）立即调用 cb()。
+        主要供 HealthMonitor 注册以即时重置冷却计时器。
+        """
+        self._disconnect_callbacks.append(cb)
+
+    def _on_disconnect_event(self) -> None:
+        """内部断连事件处理，由 on_disconnected 回调和 _simulate_disconnect 共同调用"""
+        with self._conn_lock:
+            self._connected = False
+            self._last_ping_ok_time = None
+        for cb in self._disconnect_callbacks:
+            try:
+                cb()
+            except Exception as ex:
+                logger.error(f"[{self._id()}] 断连回调异常: {ex}")
+
+    def _simulate_disconnect(self) -> None:
+        """
+        仅供测试使用：模拟 on_disconnected 回调触发。
+        生产代码通过 _Callback.on_disconnected() 自动触发。
+        """
+        self._on_disconnect_event()
+
     # ------------------------------------------------------------------
     # 状态快照（供 /health 和 /metrics 使用）
     # ------------------------------------------------------------------
@@ -591,6 +724,11 @@ class XtQuantAccount:
         if len(aid) > 4:
             return aid[:4] + "***" + aid[-1]
         return aid
+
+    @property
+    def is_reconnecting(self) -> bool:
+        """是否正在执行重连流程（含指数退避等待阶段）"""
+        return self._reconnecting
 
     def _check_trader(self) -> bool:
         """检查 xt_trader 是否可用"""

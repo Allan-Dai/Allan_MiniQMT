@@ -33,11 +33,16 @@
     const ACTIVE_POLLING_INTERVAL = 3000; // 活跃状态：3秒
     const INACTIVE_POLLING_INTERVAL = 10000; // 非活跃状态：10秒
     let pollingIntervalId = null;
-    let isMonitoring = false; // 前端监控状态，仅控制UI数据刷新
-    let isAutoTradingEnabled = false; // 自动交易状态，由全局监控总开关控制
+    let logRefreshIntervalId = null;
+    let isMonitoring = false; // 兼容字段：全局自动操作总开关状态
+    let isAutoTradingEnabled = false; // 非网格策略自动执行状态
+    let isGridTradingEnabled = true; // 网格策略自动执行状态
     let isSimulationMode = false; // 模拟交易模式
     let isPageActive = true; // 页面活跃状态
-    let userMonitoringIntent = null; // 用户监控意图（点击按钮后）
+    let userMonitoringIntent = null; // 用户自动操作总开关意图（点击按钮后）
+    let userSimulationModeIntent = null; // 用户模拟/实盘切换意图
+    let userAutoTradingIntent = null; // 用户自动交易开关意图
+    let userGridTradingIntent = null; // 用户自动网格开关意图
     let isApiConnected = true; // API连接状态，初始假设已连接
     
     // 为不同类型的数据设置不同的刷新频率
@@ -112,6 +117,9 @@
 
     // 网格交易状态存储
     let gridTradingStatus = {};  // 格式: { stock_code: { sessionId, status, config, lastUpdate } }
+    let gridDetailLastStockCode = null;
+    let gridCenterPriceInputHandler = null;
+    let gridAutoToggleHandler = null;
 
     // ============ 网格分级策略: 全局变量 ============
     let riskTemplates = {};  // 缓存风险模板数据
@@ -138,10 +146,10 @@
         StopLossEnabled: document.getElementById('StopLossEnabled'),
         singleStockMaxPosition: document.getElementById('singleStockMaxPosition'),
         totalMaxPosition: document.getElementById('totalMaxPosition'),
-        connectPort: document.getElementById('connectPort'),
-        totalAccounts: document.getElementById('totalAccounts'),
         apiToken: document.getElementById('apiToken'),
+        globalAutoOperation: document.getElementById('globalAutoOperation'),
         globalAllowBuySell: document.getElementById('globalAllowBuySell'),
+        globalAllowGridTrading: document.getElementById('globalAllowGridTrading'),
         simulationMode: document.getElementById('simulationMode'),
         // 错误提示元素
         singleBuyAmountError: document.getElementById('singleBuyAmountError'),
@@ -151,7 +159,6 @@
         stockStopLossError: document.getElementById('stockStopLossError'),
         singleStockMaxPositionError: document.getElementById('singleStockMaxPositionError'),
         totalMaxPositionError: document.getElementById('totalMaxPositionError'),
-        connectPortError: document.getElementById('connectPortError'),
         // 账户信息和状态
         accountId: document.getElementById('accountId'),
         availableBalance: document.getElementById('availableBalance'),
@@ -192,6 +199,10 @@
         if (pollingIntervalId && isMonitoring) {
             stopPolling();
             startPolling();
+        }
+
+        if (logRefreshIntervalId) {
+            startOrderLogRefresh();
         }
     });
     
@@ -287,16 +298,73 @@
             "最大总持仓"
         ) && isValid;
         
-        // 验证端口号
-        isValid = validateParameter(
-            elements.connectPort, 
-            elements.connectPortError, 
-            paramRanges.connectPort?.min, 
-            paramRanges.connectPort?.max,
-            "端口号"
-        ) && isValid;
-        
         return isValid;
+    }
+
+    async function syncAutoSwitch(payload, rollback) {
+        try {
+            const response = await apiRequest(API_ENDPOINTS.saveConfig, {
+                method: 'POST',
+                body: JSON.stringify(payload)
+            });
+            if (response.status !== 'success') {
+                throw new Error(response.message || '保存自动开关失败');
+            }
+        } catch (error) {
+            rollback();
+            showMessage(error.message || '保存自动开关失败', 'error');
+            throw error;
+        }
+    }
+
+    async function setGlobalAutoOperation(newMonitoringState) {
+        if (!validateForm()) {
+            showMessage("请检查配置参数，修正错误后再启动自动操作", 'error');
+            if (elements.globalAutoOperation) {
+                elements.globalAutoOperation.checked = isMonitoring;
+            }
+            return;
+        }
+
+        userMonitoringIntent = newMonitoringState;
+        const endpoint = newMonitoringState ? API_ENDPOINTS.startMonitor : API_ENDPOINTS.stopMonitor;
+        const actionText = newMonitoringState ? '启动' : '停止';
+        elements.toggleMonitorBtn.disabled = true;
+        if (elements.globalAutoOperation) {
+            elements.globalAutoOperation.disabled = true;
+        }
+
+        try {
+            const data = await apiRequest(endpoint, {
+                method: 'POST',
+                body: JSON.stringify({ isMonitoring: newMonitoringState })
+            });
+
+            if (data.status === 'success') {
+                isMonitoring = newMonitoringState;
+                updateMonitoringUI();
+            } else {
+                showMessage(`${actionText}自动操作失败: ${data.message || '未知错误'}`, 'error');
+                userMonitoringIntent = null;
+                if (elements.globalAutoOperation) {
+                    elements.globalAutoOperation.checked = isMonitoring;
+                }
+            }
+        } catch (error) {
+            showMessage(`${actionText}自动操作失败: ${error.message}`, 'error');
+            userMonitoringIntent = null;
+            if (elements.globalAutoOperation) {
+                elements.globalAutoOperation.checked = isMonitoring;
+            }
+        } finally {
+            elements.toggleMonitorBtn.disabled = false;
+            if (elements.globalAutoOperation) {
+                elements.globalAutoOperation.disabled = false;
+            }
+            setTimeout(() => {
+                elements.messageArea.innerHTML = '';
+            }, 3000);
+        }
     }
     
     // --- 添加参数监听器 ---
@@ -386,20 +454,6 @@
             }
         });
         
-        elements.connectPort.addEventListener('change', () => {
-            if (validateParameter(
-                elements.connectPort, 
-                elements.connectPortError, 
-                paramRanges.connectPort?.min, 
-                paramRanges.connectPort?.max,
-                "端口号"
-            )) {
-                throttledSyncParameter('connectPort', parseInt(elements.connectPort.value));
-                // 端口更改后更新API基础URL
-                updateApiBaseUrl();
-            }
-        });
-        
         // 开关类参数的实时同步
         elements.allowBuy.addEventListener('change', (event) => {
             throttledSyncParameter('allowBuy', event.target.checked);
@@ -412,28 +466,53 @@
         // 模拟交易模式切换监听
         elements.simulationMode.addEventListener('change', (event) => {
             isSimulationMode = event.target.checked;
+            userSimulationModeIntent = event.target.checked;  // 记录用户意图，防 fetchStatus 覆盖
             updateSimulationModeUI();
             throttledSyncParameter('simulationMode', event.target.checked);
         });
 
-        // 全局监控总开关 - 自动交易控制
+        // 自动止盈分开关
         elements.globalAllowBuySell.addEventListener('change', (event) => {
-            // 明确：这里只影响自动交易状态，不影响监控UI状态
+            // 明确：这里只影响非网格自动策略，不影响全局自动操作总开关
             const autoTradingEnabled = event.target.checked;
             isAutoTradingEnabled = autoTradingEnabled; // 更新本地状态
-            
-            apiRequest(API_ENDPOINTS.saveConfig, {
-                method: 'POST',
-                body: JSON.stringify({ globalAllowBuySell: autoTradingEnabled })
-            })
+            userAutoTradingIntent = autoTradingEnabled; // 记录用户意图，防 fetchStatus 覆盖
+
+            syncAutoSwitch(
+                { globalAllowBuySell: autoTradingEnabled },
+                () => {
+                    event.target.checked = !autoTradingEnabled;
+                    isAutoTradingEnabled = !autoTradingEnabled;
+                    userAutoTradingIntent = null;
+                }
+            )
             .then(response => {
-                console.log("自动交易状态已更新:", autoTradingEnabled);
+                console.log("允许自动止盈状态已更新:", autoTradingEnabled);
             })
             .catch(error => {
-                console.error("更新自动交易状态失败:", error);
-                // 可选：回滚UI状态
-                event.target.checked = !autoTradingEnabled;
-                isAutoTradingEnabled = !autoTradingEnabled;
+                console.error("更新允许自动止盈状态失败:", error);
+            });
+        });
+
+        // 自动网格分开关
+        elements.globalAllowGridTrading.addEventListener('change', (event) => {
+            const gridTradingEnabled = event.target.checked;
+            isGridTradingEnabled = gridTradingEnabled;
+            userGridTradingIntent = gridTradingEnabled;
+
+            syncAutoSwitch(
+                { globalAllowGridTrading: gridTradingEnabled },
+                () => {
+                    event.target.checked = !gridTradingEnabled;
+                    isGridTradingEnabled = !gridTradingEnabled;
+                    userGridTradingIntent = null;
+                }
+            )
+            .then(response => {
+                console.log("允许自动网格状态已更新:", gridTradingEnabled);
+            })
+            .catch(error => {
+                console.error("更新允许自动网格状态失败:", error);
             });
         });
         
@@ -454,12 +533,6 @@
             throttledSyncParameter('StopLossEnabled', event.target.checked);
         });
         
-        // 监听IP地址变更
-        elements.totalAccounts.addEventListener('change', (event) => {
-            throttledSyncParameter('totalAccounts', event.target.value);
-            // IP变更后更新API基础URL
-            updateApiBaseUrl();
-        });
     }
     
     // 更新模拟交易模式UI
@@ -593,21 +666,13 @@
         }, 1000);
     }
 
-    // 更新API基础URL
-    function updateApiBaseUrl() {
-        const ip = elements.totalAccounts.value || '127.0.0.1';
-        const port = elements.connectPort.value || '5000';
-        API_BASE_URL = `http://${ip}:${port}`;
-        
-        // 更新所有API端点
-        // for (let key in API_ENDPOINTS) {
-        //     API_ENDPOINTS[key] = `${API_BASE_URL}${API_ENDPOINTS[key]}`;
-        // }
+    // API 基础 URL 始终指向当前页面的 origin（多账号下每个端口独立访问）
+    function _buildApiEndpoints() {
+        API_BASE_URL = window.location.origin;
         API_ENDPOINTS = {};
         for (let key in ORIGINAL_API_ENDPOINTS) {
             API_ENDPOINTS[key] = `${API_BASE_URL}${ORIGINAL_API_ENDPOINTS[key]}`;
         }
-        console.log("API Base URL updated:", API_BASE_URL);
     }
 
     // API请求函数 - 添加节流
@@ -685,11 +750,14 @@
         elements.StopLossEnabled.checked = config.StopLossEnabled ?? true;
         elements.singleStockMaxPosition.value = config.singleStockMaxPosition ?? '70000';
         elements.totalMaxPosition.value = config.totalMaxPosition ?? '400000';
-        elements.connectPort.value = config.connectPort ?? '5000';
-        elements.totalAccounts.value = config.totalAccounts ?? '127.0.0.1';
         elements.globalAllowBuySell.checked = config.globalAllowBuySell ?? true;
+        elements.globalAllowGridTrading.checked = config.globalAllowGridTrading ?? true;
         elements.simulationMode.checked = config.simulationMode ?? false;
-        
+
+        isMonitoring = config.globalAutoOperation ?? false;
+        isAutoTradingEnabled = config.globalAllowBuySell ?? false;
+        isGridTradingEnabled = config.globalAllowGridTrading ?? true;
+
         // 更新模拟交易模式状态
         isSimulationMode = config.simulationMode ?? false;
         updateSimulationModeUI();
@@ -721,10 +789,26 @@
         // 获取后端状态，但不自动更新前端状态
         const backendMonitoring = statusData.isMonitoring ?? false;
         const backendAutoTrading = statusData.settings?.enableAutoTrading ?? false;
+        const backendGridTrading = statusData.settings?.enableGridTrading ?? true;
     
-        // 更新自动交易状态 - 只更新全局监控总开关，不影响监控状态
-        isAutoTradingEnabled = backendAutoTrading;
-        elements.globalAllowBuySell.checked = isAutoTradingEnabled;
+        // 更新自动交易状态 - 用户意图优先，防 fetchStatus 覆盖用户操作
+        if (userAutoTradingIntent !== null) {
+            isAutoTradingEnabled = userAutoTradingIntent;
+            elements.globalAllowBuySell.checked = userAutoTradingIntent;
+            userAutoTradingIntent = null;
+        } else {
+            isAutoTradingEnabled = backendAutoTrading;
+            elements.globalAllowBuySell.checked = isAutoTradingEnabled;
+        }
+
+        if (userGridTradingIntent !== null) {
+            isGridTradingEnabled = userGridTradingIntent;
+            elements.globalAllowGridTrading.checked = userGridTradingIntent;
+            userGridTradingIntent = null;
+        } else {
+            isGridTradingEnabled = backendGridTrading;
+            elements.globalAllowGridTrading.checked = isGridTradingEnabled;
+        }
         
         // 核心修改：用户明确的监控意图优先，用户操作后不再让后端状态覆盖前端状态
         if (userMonitoringIntent !== null) {
@@ -753,31 +837,44 @@
             window._initialMonitoringLoaded = true;
             console.log(`初始化监控状态: ${isMonitoring}`);
         }
+        if (elements.globalAutoOperation) {
+            elements.globalAutoOperation.checked = isMonitoring;
+        }
     
         // 根据最终确定的监控状态更新UI
         updateMonitoringUI();
         
         // 更新系统设置
         if (statusData.settings) {
-            // 同步模拟交易模式状态
-            isSimulationMode = statusData.settings.simulationMode || false;
-            elements.simulationMode.checked = isSimulationMode;
-            
+            // 同步模拟交易模式状态 - 用户意图优先，防 fetchStatus 覆盖用户操作
+            if (userSimulationModeIntent !== null) {
+                isSimulationMode = userSimulationModeIntent;
+                elements.simulationMode.checked = userSimulationModeIntent;
+                userSimulationModeIntent = null;
+            } else {
+                isSimulationMode = statusData.settings.simulationMode || false;
+                elements.simulationMode.checked = isSimulationMode;
+            }
+
             // 同步允许买卖设置
             elements.allowBuy.checked = statusData.settings.allowBuy || false;
             elements.allowSell.checked = statusData.settings.allowSell || false;
-            
+
             // 更新模拟交易模式UI
             updateSimulationModeUI();
         }
     }
 
-    // 新增：监控状态UI更新函数，与自动交易状态分离
+    // 全局自动操作总开关 UI 更新函数，与非网格策略自动状态分离
     function updateMonitoringUI() {
+        if (elements.globalAutoOperation) {
+            elements.globalAutoOperation.checked = isMonitoring;
+        }
+
         if (isMonitoring) {
             elements.statusIndicator.textContent = '运行中';
             elements.statusIndicator.className = 'text-lg font-bold text-green-600';
-            elements.toggleMonitorBtn.textContent = '停止执行监控';
+            elements.toggleMonitorBtn.textContent = '停止自动操作';
             elements.toggleMonitorBtn.classList.remove('bg-blue-600', 'hover:bg-blue-700');
             elements.toggleMonitorBtn.classList.add('bg-red-600', 'hover:bg-red-700');
             
@@ -788,7 +885,7 @@
         } else {
             elements.statusIndicator.textContent = '未运行';
             elements.statusIndicator.className = 'text-lg font-bold text-red-600';
-            elements.toggleMonitorBtn.textContent = '开始执行监控';
+            elements.toggleMonitorBtn.textContent = '开始自动操作';
             elements.toggleMonitorBtn.classList.remove('bg-red-600', 'hover:bg-red-700');
             elements.toggleMonitorBtn.classList.add('bg-blue-600', 'hover:bg-blue-700');
             
@@ -827,18 +924,31 @@
         }
     }
 
-    // 更新监控状态UI，用于SSE - 修改后的版本，不再让监控状态和自动交易状态相互干扰
+    // 更新自动操作状态，用于 SSE；不让总开关和非网格策略自动状态相互干扰
     function updateMonitoringInfo(monitoringInfo) {
         if (!monitoringInfo) return;
 
-        // 只更新全局监控总开关状态，不影响监控开关状态
+        // 只更新非网格策略自动分开关状态，不影响全局自动操作总开关
+        // 用户意图优先：SSE 推送也不能覆盖用户正在进行的切换操作
         if (monitoringInfo.autoTradingEnabled !== undefined) {
-            const wasAutoTrading = isAutoTradingEnabled;
-            isAutoTradingEnabled = monitoringInfo.autoTradingEnabled;
-            
-            // 只有状态有变化时才更新UI
-            if (wasAutoTrading !== isAutoTradingEnabled) {
+            if (userAutoTradingIntent !== null) {
+                isAutoTradingEnabled = userAutoTradingIntent;
+                elements.globalAllowBuySell.checked = userAutoTradingIntent;
+                userAutoTradingIntent = null;
+            } else {
+                isAutoTradingEnabled = monitoringInfo.autoTradingEnabled;
                 elements.globalAllowBuySell.checked = isAutoTradingEnabled;
+            }
+        }
+
+        if (monitoringInfo.gridTradingEnabled !== undefined) {
+            if (userGridTradingIntent !== null) {
+                isGridTradingEnabled = userGridTradingIntent;
+                elements.globalAllowGridTrading.checked = userGridTradingIntent;
+                userGridTradingIntent = null;
+            } else {
+                isGridTradingEnabled = monitoringInfo.gridTradingEnabled;
+                elements.globalAllowGridTrading.checked = isGridTradingEnabled;
             }
         }
 
@@ -851,12 +961,18 @@
             elements.allowSell.checked = monitoringInfo.allowSell;
         }
 
-        // 更新模拟交易模式
+        // 更新模拟交易模式 (SSE) - 用户意图优先
         if (monitoringInfo.simulationMode !== undefined) {
-            const wasSimulationMode = isSimulationMode;
-            isSimulationMode = monitoringInfo.simulationMode;
-            elements.simulationMode.checked = isSimulationMode;
-            
+            const wasSimulationMode = isSimulationMode;  // 先捕获旧值再修改，否则下方比较会 ReferenceError
+            if (userSimulationModeIntent !== null) {
+                isSimulationMode = userSimulationModeIntent;
+                elements.simulationMode.checked = userSimulationModeIntent;
+                userSimulationModeIntent = null;
+            } else {
+                isSimulationMode = monitoringInfo.simulationMode;
+                elements.simulationMode.checked = isSimulationMode;
+            }
+
             // 只有状态有变化时才更新UI
             if (wasSimulationMode !== isSimulationMode) {
                 updateSimulationModeUI();
@@ -1160,6 +1276,9 @@
             return;
         }
 
+        // 有数据时先清空表格（防止残留"无持仓数据"提示行）
+        elements.holdingsTableBody.innerHTML = '';
+
         // 获取现有行
         const existingRows = {};
         const existingRowElements = elements.holdingsTableBody.querySelectorAll('tr[data-stock-code]');
@@ -1284,6 +1403,41 @@
         });
     }
 
+    // 策略标识 → 友好中文标签
+    const LOG_STRATEGY_LABELS = {
+        simu: '模拟',
+        auto_partial: '浮盈',
+        auto_full: '止盈',
+        stop_loss: '止损',
+        grid: '网格',
+        manual: '手动',
+        default: '默认'
+    };
+
+    function escapeLogHtml(value) {
+        return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+    }
+
+    function getLogStrategyClass(strategyLabel) {
+        if (strategyLabel === '浮盈' || strategyLabel === '止盈') return 'profit-action';
+        if (strategyLabel === '止损') return 'stop-loss-action';
+        return '';
+    }
+
+    // 将 YYYY-MM-DD 转为 今天 / 昨天 / MM-DD
+    function formatLogDayLabel(dayStr) {
+        const today = new Date();
+        const fmt = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const todayStr = fmt(today);
+        const yestStr = fmt(new Date(today.getTime() - 86400000));
+        if (dayStr === todayStr) return '今天';
+        if (dayStr === yestStr) return '昨天';
+        const parts = dayStr.split('-');
+        return parts.length === 3 ? `${parts[1]}-${parts[2]}` : dayStr;
+    }
+
     function updateLogs(logEntries) {
         // 检查数据是否实际发生变化
         const logsStr = JSON.stringify(logEntries);
@@ -1293,61 +1447,83 @@
         }
         window._lastLogsStr = logsStr;
 
-        // 记住当前滚动位置和是否在底部
-        const isAtBottom = elements.orderLog.scrollTop + elements.orderLog.clientHeight >= elements.orderLog.scrollHeight - 10;
-        const currentScrollTop = elements.orderLog.scrollTop;
+        const container = elements.orderLog;
+        const prevScrollTop = container.scrollTop;
 
         elements.logLoading.classList.add('hidden');
         elements.logError.classList.add('hidden');
 
-        // 格式化日志内容
-        if (Array.isArray(logEntries)) {
-            // 新的格式化逻辑，符合要求的格式
-            const formattedLogs = logEntries.map(entry => {
-                if (typeof entry === 'object' && entry !== null) {
-                    // 修改：转换日期格式为 MM-DD HH:MM:SS
-                    let dateStr = '';
-                    if (entry.trade_time) {
-                        const date = new Date(entry.trade_time);
-                        const month = String(date.getMonth() + 1).padStart(2, '0');
-                        const day = String(date.getDate()).padStart(2, '0');
-                        const hours = String(date.getHours()).padStart(2, '0');
-                        const minutes = String(date.getMinutes()).padStart(2, '0');
-                        const seconds = String(date.getSeconds()).padStart(2, '0');
-                        dateStr = `${month}-${day} ${hours}:${minutes}:${seconds}`;
-                    }                   
-                    // 转换交易类型
-                    const actionType = entry.trade_type === 'BUY' ? '买' : 
-                                    (entry.trade_type === 'SELL' ? '卖' : entry.trade_type);
-                    
-                    // 格式化为要求的格式
-                    const formattedPrice = entry.price ? Number(entry.price).toFixed(2) : '';
-                    const formattedVolume = entry.volume ? Number(entry.volume).toFixed(0) : '';
-                    return `${dateStr}, ${entry.stock_code || ''}, ${entry.stock_name || ''}, ${actionType}, 价: ${formattedPrice}, 量: ${formattedVolume}, 策略: ${entry.strategy || ''}`;
-                } else {
-                    return String(entry); // 如果不是对象，直接转换为字符串
-                }
-            });
-            elements.orderLog.value = formattedLogs.join('\n');
-            
-            // 标记数据已更新
-            console.log("Logs updated with new data");
-        } else {
-            elements.orderLog.value = "无可识别的日志数据";
-            console.error("未知的日志数据格式:", logEntries);
+        if (!Array.isArray(logEntries) || logEntries.length === 0) {
+            container.innerHTML = '<div class="log-empty">暂无交易记录</div>';
+            return;
         }
 
-        // 只有当之前在底部时，才自动滚动到底部
-        if (isAtBottom) {
-            setTimeout(() => {
-                elements.orderLog.scrollTop = elements.orderLog.scrollHeight;
-            }, 10);
-        } else {
-            // 否则保持原来的滚动位置
-            setTimeout(() => {
-                elements.orderLog.scrollTop = currentScrollTop;
-            }, 10);
-        }
+        const parts = [];
+        let lastDay = null;
+
+        // 总行宽 100%, 小数宽 11px, 简写标记 width/number 设 0 即去掉列
+        parts.push(
+          `<div class="log-head">` +
+            `<span class="log-col-side"></span>` +
+            `<span class="log-col-name">股票</span>` +
+            `<span class="log-col-dir"></span>` +
+            `<span class="log-col-money">金额</span>` +
+            `<span class="log-col-price">价×量</span>` +
+            `<span class="log-col-tag">策略</span>` +
+          `</div>`
+        );
+
+        logEntries.forEach(entry => {
+            if (typeof entry !== 'object' || entry === null) return;
+
+            const tradeTime = entry.trade_time || '';
+            const dayPart = tradeTime.slice(0, 10);
+            const timePart = tradeTime.slice(11, 16);   // HH:MM（mm:ss 在窄列太累赘）
+
+            if (dayPart && dayPart !== lastDay) {
+                lastDay = dayPart;
+                parts.push(`<div class="log-day-header">${escapeLogHtml(formatLogDayLabel(dayPart))}</div>`);
+            }
+
+            const isBuy = entry.trade_type === 'BUY';
+            const isSell = entry.trade_type === 'SELL';
+            const sideText = isBuy ? 'B' : (isSell ? 'S' : escapeLogHtml(entry.trade_type || '?'));
+
+            const price = entry.price != null ? Number(entry.price).toFixed(2) : '--';
+            const volume = entry.volume != null ? Number(entry.volume).toLocaleString('zh-CN') : '--';
+
+            let amount = entry.amount;
+            if (amount == null && entry.price != null && entry.volume != null) {
+                amount = Number(entry.price) * Number(entry.volume);
+            }
+            const amountText = amount != null
+                ? Number(amount).toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+                : '--';
+
+            const strategyRaw = entry.strategy || '';
+            const strategyLabel = LOG_STRATEGY_LABELS[strategyRaw] || strategyRaw;
+            const strategyClass = getLogStrategyClass(strategyLabel);
+
+            const sideTitle = isBuy ? '买入' : (isSell ? '卖出' : escapeLogHtml(entry.trade_type || ''));
+            const name = escapeLogHtml(entry.stock_name || entry.stock_code || '');
+            const code = escapeLogHtml(entry.stock_code || '');
+            // 单行紧凑：B/S | 平安银行 | ¥31,500 | 10.50×3000 | 网格 | HH:MM
+            parts.push(
+                `<div class="log-row ${strategyClass}" title="${sideTitle} ${name} ${code}  ¥${amountText}  ${price}×${volume}  ${strategyLabel}">` +
+                    `<span class="log-col-side ${strategyClass}">${sideText}</span>` +
+                    `<span class="log-col-name">${name}</span>` +
+                    `<span class="log-col-dir ${strategyClass}">${sideText}</span>` +
+                    `<span class="log-col-money ${strategyClass}">${amountText}</span>` +
+                    `<span class="log-col-price">${price}×${volume}</span>` +
+                    `<span class="log-col-tag ${strategyClass}">${escapeLogHtml(strategyLabel)}</span>` +
+                    `<span class="log-col-time">${timePart}</span>` +
+                `</div>`
+            );
+        });
+
+        container.innerHTML = parts.join('');
+        container.scrollTop = prevScrollTop;
+        console.log("Logs updated with new data");
     }
 
     // --- 数据获取函数 ---
@@ -1576,60 +1752,9 @@
 
 
     // --- 操作处理函数 ---
-    // 修改后的监控开启/关闭函数 - 只影响前端数据刷新，不再与后端自动交易状态混淆
+    // 全局自动操作总开关：控制所有自动策略是否产生新交易动作
     async function handleToggleMonitor() {
-        // 先验证表单数据
-        if (!validateForm()) {
-            showMessage("请检查配置参数，修正错误后再启动监控", 'error');
-            return;
-        }
-
-        // 先设置本地用户意图状态
-        const newMonitoringState = !isMonitoring;
-        userMonitoringIntent = newMonitoringState; // 记录用户意图
-        
-        const endpoint = isMonitoring ? API_ENDPOINTS.stopMonitor : API_ENDPOINTS.startMonitor;
-        const actionText = isMonitoring ? '停止' : '启动';
-        elements.toggleMonitorBtn.disabled = true;
-        // showMessage(`${actionText}监控中...`, 'loading', 0);
-
-        try {
-            // 构建仅包含监控状态的数据
-            const monitoringData = {
-                isMonitoring: newMonitoringState
-            };
-            
-            const data = await apiRequest(endpoint, { 
-                method: 'POST',                
-                body: JSON.stringify(monitoringData)
-            });
-
-            if (data.status === 'success') {
-                // 直接更新本地状态，不等待fetchStatus
-                isMonitoring = newMonitoringState;
-                
-                // 更新UI
-                updateMonitoringUI();
-                
-                // showMessage(`${actionText}监控成功: ${data.message || ''}（注意：此操作不影响自动交易）`, 'success');
-            } else {
-                showMessage(`${actionText}监控失败: ${data.message || '未知错误'}`, 'error');
-                // 恢复用户意图，因为操作失败
-                userMonitoringIntent = null;
-            }
-            
-            // 跳过调用fetchStatus，因为我们已经主动设置了状态
-        } catch (error) {
-            showMessage(`${actionText}监控失败: ${error.message}`, 'error');
-            // 恢复用户意图，因为操作失败
-            userMonitoringIntent = null;
-        } finally {
-            elements.toggleMonitorBtn.disabled = false;
-            // 3秒后清除消息
-            setTimeout(() => {
-                elements.messageArea.innerHTML = '';
-            }, 3000);
-        }
+        await setGlobalAutoOperation(!isMonitoring);
     }
 
     // 获取所有配置表单的值
@@ -1648,10 +1773,9 @@
             StopLossEnabled: elements.StopLossEnabled.checked,
             singleStockMaxPosition: parseFloat(elements.singleStockMaxPosition.value) || 70000,
             totalMaxPosition: parseFloat(elements.totalMaxPosition.value) || 400000,
-            connectPort: elements.connectPort.value || '5000',
-            totalAccounts: elements.totalAccounts.value || '127.0.0.1',
             globalAllowBuySell: elements.globalAllowBuySell.checked,
-            simulationMode: elements.simulationMode.checked            
+            globalAllowGridTrading: elements.globalAllowGridTrading.checked,
+            simulationMode: elements.simulationMode.checked
         };
     }
 
@@ -1682,6 +1806,7 @@
                 
                 // 更新自动交易状态
                 isAutoTradingEnabled = configData.globalAllowBuySell;
+                isGridTradingEnabled = configData.globalAllowGridTrading;
             } else {
                 showMessage(data.message || "保存失败", 'error');
                 
@@ -1739,7 +1864,7 @@
             
             if (data.status === 'success') {
                 showMessage(data.message || "日志已清空", 'success');
-                elements.orderLog.value = ''; // 立即清空前端显示
+                elements.orderLog.innerHTML = '<div class="log-empty">暂无交易记录</div>'; // 立即清空前端显示
                 window._lastLogsStr = ''; // 重置日志缓存
             } else {
                 showMessage(data.message || "清空日志失败", 'error');
@@ -1762,8 +1887,8 @@
         // 二次确认
         if (!confirm("再次确认：您真的要执行初始化持仓数据吗？")) return;
 
-        // 更新API基础URL
-        updateApiBaseUrl();
+        // 构建 API 端点（基于当前页面的 origin）
+        if (!API_ENDPOINTS.initPositions) _buildApiEndpoints();
 
         // 先验证表单数据
         if (!validateForm()) {
@@ -1895,6 +2020,24 @@
         console.log("Stopping data polling.");
         clearInterval(pollingIntervalId);
         pollingIntervalId = null;
+    }
+
+    function getOrderLogRefreshInterval() {
+        return isPageActive ? DATA_REFRESH_INTERVALS.logs : INACTIVE_POLLING_INTERVAL;
+    }
+
+    function startOrderLogRefresh() {
+        if (logRefreshIntervalId) {
+            clearInterval(logRefreshIntervalId);
+            logRefreshIntervalId = null;
+        }
+
+        const refreshInterval = getOrderLogRefreshInterval();
+        logRefreshIntervalId = setInterval(() => {
+            fetchLogs();
+        }, refreshInterval);
+
+        console.log(`Order log refresh started with interval: ${refreshInterval}ms`);
     }
 
     async function pollData() {
@@ -2096,10 +2239,6 @@
         checkboxes.forEach(cb => cb.checked = isChecked);
     });
 
-    // IP/端口变化监听器
-    elements.totalAccounts.addEventListener('change', updateApiBaseUrl);
-    elements.connectPort.addEventListener('change', updateApiBaseUrl);
-
     // API Token localStorage 持久化
     const _savedToken = localStorage.getItem('qmt_api_token');
     if (_savedToken && elements.apiToken) elements.apiToken.value = _savedToken;
@@ -2109,8 +2248,7 @@
 
     // --- 初始数据加载 ---
     async function fetchAllData() {
-        // 初始化API基础URL
-        updateApiBaseUrl();
+        _buildApiEndpoints();
 
         showMessage("正在加载初始数据...", 'loading', 0);
 
@@ -2131,6 +2269,8 @@
         } catch (error) {
             showMessage("部分数据加载失败", 'error', 3000);
         }
+
+        startOrderLogRefresh();
 
         // 如果监控状态为开启，则自动启动轮询
         if (isMonitoring) {
@@ -2154,6 +2294,68 @@
     // ⭐ 事件处理器存储变量（函数级作用域，用于移除旧监听器）
     let gridConfirmHandler = null;
     let gridCancelHandler = null;
+
+    function formatGridDeviationText(currentPrice, centerPrice) {
+        const current = Number(currentPrice || 0);
+        const center = Number(centerPrice || 0);
+        if (current <= 0 || center <= 0) {
+            return { text: '', className: 'ml-2 text-xs font-semibold text-gray-500' };
+        }
+        const deviation = calculateDeviation(center, current);
+        const sign = deviation > 0 ? '+' : '';
+        let className = 'ml-2 text-xs font-semibold ';
+        if (Math.abs(deviation) >= 10) {
+            className += 'text-amber-600';
+        } else if (deviation > 0) {
+            className += 'text-red-600';
+        } else if (deviation < 0) {
+            className += 'text-green-600';
+        } else {
+            className += 'text-gray-500';
+        }
+        return {
+            text: `偏离 ${sign}${deviation.toFixed(2)}%`,
+            className
+        };
+    }
+
+    function updateGridPriceDeviation(currentPrice, centerPrice) {
+        const deviationEl = document.getElementById('gridCurrentPriceDeviation');
+        if (!deviationEl) return;
+        const rendered = formatGridDeviationText(currentPrice, centerPrice);
+        deviationEl.textContent = rendered.text;
+        deviationEl.className = rendered.className;
+    }
+
+    function updateGridAutoToggleUI(enabled) {
+        const autoCheckbox = document.getElementById('gridAutoEnabled');
+        const autoLabel = document.getElementById('gridAutoStatusLabel');
+        if (autoCheckbox) {
+            autoCheckbox.checked = enabled;
+        }
+        if (autoLabel) {
+            autoLabel.textContent = enabled ? '自动' : '暂停';
+            autoLabel.className = enabled
+                ? 'ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-700'
+                : 'ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-200 text-slate-600';
+        }
+    }
+
+    async function setGridSessionEnabled(sessionId, enabled) {
+        const response = await fetch(`${API_BASE_URL}/api/grid/session/${sessionId}/enabled`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(elements.apiToken?.value.trim() ? { 'X-API-Token': elements.apiToken.value.trim() } : {})
+            },
+            body: JSON.stringify({ enabled })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+            throw new Error(result.error || '更新网格自动开关失败');
+        }
+        return result;
+    }
 
     /**
      * 显示网格交易配置对话框
@@ -2230,6 +2432,8 @@
             const hasActiveSession = sessionData.has_session;
             let config = sessionData.config;  // ⭐ API直接返回配置（小数格式，前端乘以100显示）
             const activeSessionId = sessionData.session_id;
+            const sessionEnabled = sessionData.enabled !== false && (!config || config.enabled !== false);
+            const stats = sessionData.stats || {};
 
             // ⭐ 调试日志
             console.log('网格会话数据:', {
@@ -2244,20 +2448,78 @@
 
             // ⭐ 显示实时市场价（移除来源说明，界面已明确标注）
             const centerPriceInput = document.getElementById('gridCenterPriceInput');
+            const activeCenterPrice = hasActiveSession
+                ? Number(stats.current_center_price || config?.center_price || 0)
+                : 0;
 
             // ⭐ 优化: 如果有active session，输入框显示已保存的center_price，否则显示实时市场价
             if (hasActiveSession && config && config.center_price) {
                 // 有active session: 显示已保存的配置
                 document.getElementById('gridCurrentPrice').textContent = `¥${centerPrice.toFixed(2)}`;
                 centerPriceInput.value = parseFloat(config.center_price).toFixed(2);
+                updateGridPriceDeviation(centerPrice, activeCenterPrice);
             } else if (centerPrice > 0) {
                 // 无active session: 显示实时市场价
                 document.getElementById('gridCurrentPrice').textContent = `¥${centerPrice.toFixed(2)}`;
                 centerPriceInput.value = centerPrice.toFixed(2);
+                updateGridPriceDeviation(centerPrice, centerPriceInput.value);
             } else {
                 document.getElementById('gridCurrentPrice').textContent = `价格不可用`;
                 centerPriceInput.value = '';
                 centerPriceInput.placeholder = '请手动输入网格中心价格';
+                updateGridPriceDeviation(0, 0);
+            }
+
+            if (gridCenterPriceInputHandler) {
+                centerPriceInput.removeEventListener('input', gridCenterPriceInputHandler);
+            }
+            gridCenterPriceInputHandler = () => {
+                const compareCenter = hasActiveSession
+                    ? activeCenterPrice
+                    : parseFloat(centerPriceInput.value);
+                updateGridPriceDeviation(centerPrice, compareCenter);
+            };
+            centerPriceInput.addEventListener('input', gridCenterPriceInputHandler);
+
+            const autoToggleRow = document.getElementById('gridAutoToggleRow');
+            const autoCheckbox = document.getElementById('gridAutoEnabled');
+            if (autoToggleRow && autoCheckbox) {
+                if (gridAutoToggleHandler) {
+                    autoCheckbox.removeEventListener('change', gridAutoToggleHandler);
+                }
+                if (hasActiveSession) {
+                    autoToggleRow.classList.remove('hidden');
+                    updateGridAutoToggleUI(sessionEnabled);
+                    gridAutoToggleHandler = async (event) => {
+                        const nextEnabled = event.target.checked;
+                        event.target.disabled = true;
+                        try {
+                            const result = await setGridSessionEnabled(activeSessionId, nextEnabled);
+                            updateGridAutoToggleUI(result.enabled);
+                            gridTradingStatus[normalizedCode] = {
+                                ...(gridTradingStatus[normalizedCode] || {}),
+                                sessionId: activeSessionId,
+                                status: 'active',
+                                enabled: result.enabled,
+                                config,
+                                lastUpdate: Date.now()
+                            };
+                            showMessage(result.message || (result.enabled ? '个股网格自动执行已开启' : '个股网格自动执行已关闭'), 'success');
+                            await updateAllGridTradingStatus();
+                        } catch (error) {
+                            console.error('更新网格自动开关失败:', error);
+                            updateGridAutoToggleUI(!nextEnabled);
+                            showMessage('更新网格自动开关失败: ' + error.message, 'error');
+                        } finally {
+                            event.target.disabled = false;
+                        }
+                    };
+                    autoCheckbox.addEventListener('change', gridAutoToggleHandler);
+                } else {
+                    autoToggleRow.classList.add('hidden');
+                    autoCheckbox.checked = true;
+                    gridAutoToggleHandler = null;
+                }
             }
 
             // ⭐ 如果存在active session，显示原网格中心价
@@ -2266,6 +2528,9 @@
             if (hasActiveSession && config && config.center_price) {
                 existingCenterPriceRow.style.display = 'block';
                 existingCenterPriceSpan.textContent = `¥${parseFloat(config.center_price).toFixed(2)}`;
+                if (stats.current_center_price && Number(stats.current_center_price) !== Number(config.center_price)) {
+                    existingCenterPriceSpan.textContent += ` / 当前 ¥${Number(stats.current_center_price).toFixed(2)}`;
+                }
             } else {
                 existingCenterPriceRow.style.display = 'none';
             }
@@ -2315,6 +2580,7 @@
             // ⭐ 绑定按钮事件（优雅方式：先移除旧监听器，再添加新监听器）
             const confirmBtn = document.getElementById('gridDialogConfirmBtn');
             const cancelBtn = document.getElementById('gridDialogCancelBtn');
+            const detailBtn = document.getElementById('gridDialogDetailBtn');
 
             // 1. 移除旧的事件监听器（如果存在）
             if (gridConfirmHandler) {
@@ -2330,6 +2596,10 @@
                 confirmBtn.textContent = '停止网格交易';
                 confirmBtn.classList.remove('bg-blue-600', 'hover:bg-blue-700');
                 confirmBtn.classList.add('bg-red-600', 'hover:bg-red-700');
+                if (detailBtn) {
+                    detailBtn.classList.remove('hidden');
+                    detailBtn.onclick = () => showGridDetailDialog(normalizedCode);
+                }
 
                 // 创建命名函数用于停止网格
                 gridConfirmHandler = async () => {
@@ -2344,6 +2614,10 @@
                 confirmBtn.textContent = '启动网格交易';
                 confirmBtn.classList.remove('bg-red-600', 'hover:bg-red-700');
                 confirmBtn.classList.add('bg-blue-600', 'hover:bg-blue-700');
+                if (detailBtn) {
+                    detailBtn.classList.add('hidden');
+                    detailBtn.onclick = null;
+                }
 
                 // 创建命名函数用于启动网格
                 gridConfirmHandler = async () => {
@@ -2576,6 +2850,198 @@
         }
     }
 
+    function formatGridMoney(value) {
+        const num = Number(value || 0);
+        const sign = num > 0 ? '+' : '';
+        return `${sign}${num.toFixed(2)}元`;
+    }
+
+    function formatGridPercent(value, alreadyPercent = false) {
+        const num = Number(value || 0);
+        const percent = alreadyPercent ? num : num * 100;
+        const sign = percent > 0 ? '+' : '';
+        return `${sign}${percent.toFixed(2)}%`;
+    }
+
+    function formatGridNumber(value, digits = 2) {
+        const num = Number(value || 0);
+        return num.toFixed(digits);
+    }
+
+    function setGridPnlClass(element, value) {
+        if (!element) return;
+        element.classList.remove('text-red-600', 'text-green-600', 'text-gray-900');
+        const num = Number(value || 0);
+        if (num > 0) {
+            element.classList.add('text-red-600');
+        } else if (num < 0) {
+            element.classList.add('text-green-600');
+        } else {
+            element.classList.add('text-gray-900');
+        }
+    }
+
+    function getGridSessionByStock(sessions, stockCode) {
+        const normalizedCode = normalizeStockCode(stockCode);
+        return (sessions || []).find(session =>
+            normalizeStockCode(session.stock_code) === normalizedCode &&
+            String(session.status || '').toLowerCase() === 'active'
+        ) || (sessions || []).find(session => normalizeStockCode(session.stock_code) === normalizedCode);
+    }
+
+    async function fetchGridDetailData(stockCode) {
+        const normalizedCode = normalizeStockCode(stockCode);
+        const sessionsResponse = await fetch(`${API_BASE_URL}/api/grid/sessions`);
+        if (!sessionsResponse.ok) {
+            throw new Error('获取网格会话列表失败');
+        }
+        const sessionsData = await sessionsResponse.json();
+        if (!sessionsData.success || !Array.isArray(sessionsData.sessions)) {
+            throw new Error(sessionsData.error || '网格会话数据格式错误');
+        }
+
+        const session = getGridSessionByStock(sessionsData.sessions, normalizedCode);
+        if (!session) {
+            throw new Error('未找到该股票的网格会话');
+        }
+
+        const sessionId = session.session_id || session.id;
+        const tradesResponse = await fetch(`${API_BASE_URL}/api/grid/trades/${sessionId}?limit=20&offset=0`);
+        if (!tradesResponse.ok) {
+            throw new Error('获取网格交易记录失败');
+        }
+        const tradesData = await tradesResponse.json();
+        if (!tradesData.success) {
+            throw new Error(tradesData.error || '网格交易记录数据格式错误');
+        }
+
+        return {
+            session,
+            trades: Array.isArray(tradesData.trades) ? tradesData.trades : [],
+            totalCount: Number(tradesData.total_count || 0)
+        };
+    }
+
+    function renderGridDetail(data) {
+        const session = data.session || {};
+        const snapshot = session.pnl_snapshot || {};
+        const statusNames = {
+            active: '运行中',
+            stopping: '停止中',
+            stopped: '已停止',
+            paused: '已暂停'
+        };
+        const status = String(session.status || 'active').toLowerCase();
+
+        document.getElementById('gridDetailStockCode').textContent = session.stock_code || '--';
+        document.getElementById('gridDetailStatus').textContent = statusNames[status] || session.status || '--';
+
+        const totalPnl = Number(snapshot.total_pnl ?? session.grid_profit ?? 0);
+        const realizedPnl = Number(snapshot.realized_pnl ?? 0);
+        const unrealizedPnl = Number(snapshot.unrealized_pnl ?? 0);
+        const profitRatio = Number(snapshot.profit_ratio ?? session.profit_ratio ?? 0);
+        const currentInvestment = Number(session.current_investment || 0);
+        const maxInvestment = Number(session.max_investment || snapshot.denominator || 0);
+        const investmentRatio = maxInvestment > 0 ? currentInvestment / maxInvestment : 0;
+
+        const totalPnlEl = document.getElementById('gridDetailTotalPnl');
+        const realizedEl = document.getElementById('gridDetailRealizedPnl');
+        const unrealizedEl = document.getElementById('gridDetailUnrealizedPnl');
+        totalPnlEl.textContent = formatGridMoney(totalPnl);
+        realizedEl.textContent = formatGridMoney(realizedPnl);
+        unrealizedEl.textContent = formatGridMoney(unrealizedPnl);
+        setGridPnlClass(totalPnlEl, totalPnl);
+        setGridPnlClass(realizedEl, realizedPnl);
+        setGridPnlClass(unrealizedEl, unrealizedPnl);
+
+        const ratioEl = document.getElementById('gridDetailProfitRatio');
+        ratioEl.textContent = `盈亏率 ${formatGridPercent(profitRatio)}`;
+        setGridPnlClass(ratioEl, profitRatio);
+
+        document.getElementById('gridDetailOpenVolume').textContent =
+            `未平网格 ${Number(snapshot.open_volume || 0).toFixed(0)} 股`;
+        document.getElementById('gridDetailInvestment').textContent =
+            `${currentInvestment.toFixed(0)} / ${maxInvestment.toFixed(0)}元`;
+        document.getElementById('gridDetailInvestmentRatio').textContent =
+            `使用率 ${formatGridPercent(investmentRatio)}`;
+        document.getElementById('gridDetailTradeCount').textContent =
+            `${session.trade_count || 0}次（买${session.buy_count || 0}/卖${session.sell_count || 0}）`;
+        document.getElementById('gridDetailCenterPrice').textContent =
+            `初始 ${formatGridNumber(session.center_price)} / 当前 ${formatGridNumber(session.current_center_price)}`;
+
+        const methodEl = document.getElementById('gridDetailMethod');
+        const methodName = snapshot.method === 'ledger_true_pnl'
+            ? '真实账本'
+            : snapshot.method === 'memory_true_pnl'
+                ? '内存真实盈亏'
+                : '兼容降级';
+        methodEl.textContent = `${methodName}${snapshot.is_degraded ? ' · 降级' : ''}`;
+        methodEl.className = `grid-detail-method${snapshot.is_degraded ? ' degraded' : ''}`;
+
+        document.getElementById('gridDetailTradeTotal').textContent =
+            `共 ${data.totalCount || data.trades.length} 条，显示最近 ${data.trades.length} 条`;
+
+        const tbody = document.getElementById('gridDetailTradesBody');
+        if (!data.trades.length) {
+            tbody.innerHTML = `
+                <tr>
+                    <td class="px-3 py-6 text-center text-gray-500" colspan="7">暂无网格交易记录</td>
+                </tr>
+            `;
+            return;
+        }
+
+        tbody.innerHTML = data.trades.map(trade => {
+            const side = String(trade.trade_type || '').toUpperCase();
+            const sideClass = side === 'BUY' ? 'text-red-600' : 'text-green-600';
+            const sideText = side === 'BUY' ? '买入' : side === 'SELL' ? '卖出' : side || '--';
+            const timeText = trade.trade_time ? String(trade.trade_time).replace('T', ' ').slice(0, 19) : '--';
+            return `
+                <tr class="hover:bg-gray-50">
+                    <td class="px-3 py-2 text-gray-700">${timeText}</td>
+                    <td class="px-3 py-2 font-medium ${sideClass}">${sideText}</td>
+                    <td class="px-3 py-2 text-right">${formatGridNumber(trade.trigger_price)}</td>
+                    <td class="px-3 py-2 text-right">${Number(trade.volume || 0).toFixed(0)}</td>
+                    <td class="px-3 py-2 text-right">${formatGridNumber(trade.amount)}</td>
+                    <td class="px-3 py-2 text-right">${formatGridNumber(trade.grid_level)}</td>
+                    <td class="px-3 py-2 text-gray-500">${trade.trade_id || '--'}</td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    async function showGridDetailDialog(stockCode) {
+        const normalizedCode = normalizeStockCode(stockCode);
+        if (!normalizedCode) {
+            showMessage('股票代码无效', 'error');
+            return;
+        }
+
+        gridDetailLastStockCode = normalizedCode;
+        const dialog = document.getElementById('gridDetailDialog');
+        const loading = document.getElementById('gridDetailLoading');
+        const content = document.getElementById('gridDetailContent');
+        dialog.classList.remove('hidden');
+        loading.classList.remove('hidden');
+        content.classList.add('hidden');
+
+        try {
+            const detailData = await fetchGridDetailData(normalizedCode);
+            renderGridDetail(detailData);
+            loading.classList.add('hidden');
+            content.classList.remove('hidden');
+        } catch (error) {
+            console.error('加载网格详情失败:', error);
+            loading.classList.add('hidden');
+            content.classList.remove('hidden');
+            showMessage('加载网格详情失败: ' + error.message, 'error');
+        }
+    }
+
+    function hideGridDetailDialog() {
+        document.getElementById('gridDetailDialog').classList.add('hidden');
+    }
+
     /**
      * 停止指定ID的网格交易会话
      * @param {number} sessionId - 会话ID
@@ -2718,6 +3184,7 @@
                     gridTradingStatus[stockCode] = {
                         sessionId: session.session_id ?? session.sessionId ?? session.id,
                         status,
+                        enabled: session.enabled !== false,
                         config: session.config,
                         lastUpdate: Date.now()
                     };
@@ -2771,6 +3238,7 @@
                 gridTradingStatus[normalizedCode] = {
                     sessionId: data.session_id,
                     status: 'active',
+                    enabled: true,
                     lastUpdate: Date.now()
                 };
                 updateGridCheckboxStyle(normalizedCode, 'active');
@@ -2863,11 +3331,21 @@
 
         // 网格盈亏
         if (data.stats) {
-            const profitRatio = data.stats.profit_ratio || 0;
+            const snapshot = data.stats.pnl_snapshot || {};
+            const profitRatio = Number(data.stats.profit_ratio || 0);
+            const displayRatio = Math.abs(profitRatio) <= 1 ? profitRatio * 100 : profitRatio;
             const profitElement = document.getElementById('tooltipProfit');
-            const profitSign = profitRatio >= 0 ? '+' : '';
-            profitElement.textContent = `${profitSign}${profitRatio.toFixed(2)}%`;
+            const profitSign = displayRatio >= 0 ? '+' : '';
+            profitElement.textContent = `${profitSign}${displayRatio.toFixed(2)}%`;
             profitElement.className = profitRatio >= 0 ? 'tooltip-value profit' : 'tooltip-value loss';
+
+            const breakdown = document.getElementById('tooltipPnlBreakdown');
+            if (breakdown) {
+                const realized = Number(snapshot.realized_pnl || 0);
+                const unrealized = Number(snapshot.unrealized_pnl || 0);
+                breakdown.textContent = `${formatGridMoney(realized)} / ${formatGridMoney(unrealized)}`;
+                breakdown.className = (realized + unrealized) >= 0 ? 'tooltip-value profit' : 'tooltip-value loss';
+            }
         }
 
         // 交易次数
@@ -2932,6 +3410,19 @@
 
     console.log("Adding event listeners and fetching initial data...");
 
+    const gridDetailCloseBtn = document.getElementById('gridDetailCloseBtn');
+    if (gridDetailCloseBtn) {
+        gridDetailCloseBtn.addEventListener('click', hideGridDetailDialog);
+    }
+    const gridDetailDialog = document.getElementById('gridDetailDialog');
+    if (gridDetailDialog) {
+        gridDetailDialog.addEventListener('click', (event) => {
+            if (event.target === gridDetailDialog) {
+                hideGridDetailDialog();
+            }
+        });
+    }
+
     // ⚠️ 新增: 加载风险模板
     loadRiskTemplates();
 
@@ -2941,6 +3432,7 @@
     window.applyRiskTemplate = applyRiskTemplate;
     window.showGridTooltip = showGridTooltip;
     window.hideGridTooltip = hideGridTooltip;
+    window.showGridDetailDialog = showGridDetailDialog;
 });
 
 console.log("Script loaded");

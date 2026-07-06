@@ -257,28 +257,41 @@ class TradingExecutor:
             trade_id = deal_info.m_strTradeID
             commission = deal_info.m_dComssion
             trade_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 保存交易记录到数据库 - 确保传递正确的策略名称
-            # 在这里处理可能需要从order_cache或其他地方获取strategy信息
-            strategy = 'default'  # 默认值
-            
-            # 查找对应的订单信息
             order_id = deal_info.m_strOrderID
-            if order_id in self.order_cache:
-                # 如果缓存中有这个订单，尝试获取它的策略标识
-                order_info = self.order_cache[order_id]
-                if hasattr(order_info, 'strategy'):
-                    strategy = order_info.strategy
-            
-            self._save_trade_record(stock_code, trade_time, trade_type, price, volume, amount, trade_id, commission, strategy)
-            
+
+            strategy = self._get_order_strategy(order_id)
+            grid_manager = getattr(self.position_manager, 'grid_manager', None)
+            defer_grid_record = self._should_defer_trade_record_until_deal(strategy, is_simulation=False)
+            if (not defer_grid_record and grid_manager
+                    and getattr(config, 'ENABLE_GRID_TRADING', False)
+                    and getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True)):
+                pending_orders = getattr(grid_manager, 'pending_grid_orders', {})
+                if isinstance(pending_orders, dict) and str(order_id) in pending_orders:
+                    strategy = getattr(config, 'GRID_STRATEGY_NAME', 'grid')
+                    defer_grid_record = True
+
+            grid_handled = False
+            if getattr(config, 'ENABLE_GRID_TRADING', False) and grid_manager:
+                try:
+                    grid_handled = bool(grid_manager.handle_deal_callback(deal_info))
+                except Exception as grid_err:
+                    logger.warning(f"网格成交确认处理失败: {grid_err}")
+
+            if defer_grid_record:
+                if not grid_handled:
+                    logger.warning(
+                        f"实盘网格成交回报未匹配待确认委托，跳过通用交易流水写入: "
+                        f"order_id={order_id}, trade_id={trade_id}"
+                    )
+            else:
+                self._save_trade_record(
+                    stock_code, trade_time, trade_type, price, volume, amount,
+                    trade_id, commission, strategy
+                )
+
             # 更新持仓信息
             self._update_position_after_trade(stock_code, trade_type, price, volume)
-            
-            # 处理网格交易
-            if config.GRID_TRADING_ENABLED:
-                self._handle_grid_trade_after_deal(stock_code, trade_type, price, volume, trade_id)
-            
+
             # 执行回调函数
             if trade_id in self.callbacks:
                 callback_fn = self.callbacks.pop(trade_id)
@@ -298,9 +311,16 @@ class TradingExecutor:
             order_id = order_info.m_strOrderSysID
             stock_code = order_info.m_strInstrumentID
             status = order_info.m_nOrderStatus
-            
+
             # 缓存委托记录
-            self.order_cache[order_id] = order_info
+            existing_order_info = self._get_order_cache_entry(order_id)
+            if isinstance(existing_order_info, dict):
+                cached_order_info = dict(existing_order_info)
+                cached_order_info['raw_order_info'] = order_info
+                cached_order_info['order_status'] = status
+            else:
+                cached_order_info = order_info
+            self.order_cache[str(order_id)] = cached_order_info
             
             status_desc = {
                 48: "未报",
@@ -318,6 +338,13 @@ class TradingExecutor:
             logger.info(f"收到委托回调: {stock_code}, 委托号: {order_id}, 状态: {status_desc.get(status, '未知')}")
             
             # 如果委托已完成（已成、已撤、废单），移除回调
+            grid_manager = getattr(self.position_manager, 'grid_manager', None)
+            if getattr(config, 'ENABLE_GRID_TRADING', False) and grid_manager:
+                try:
+                    grid_manager.handle_order_callback(order_info)
+                except Exception as grid_err:
+                    logger.warning(f"网格委托状态回调处理失败: {grid_err}")
+
             if status in [54, 56, 57]:
                 if order_id in self.callbacks:
                     logger.debug(f"委托 {order_id} 已完成，移除回调")
@@ -326,6 +353,20 @@ class TradingExecutor:
         except Exception as e:
             logger.error(f"处理委托回调时出错: {str(e)}")
     
+    def query_stock_orders(self):
+        """查询当日委托，供网格启动对账使用。"""
+        qmt_trader = getattr(self.position_manager, 'qmt_trader', None)
+        if qmt_trader and hasattr(qmt_trader, 'query_stock_orders'):
+            return qmt_trader.query_stock_orders()
+        return []
+
+    def query_stock_trades(self):
+        """查询当日成交，供网格启动对账使用。"""
+        qmt_trader = getattr(self.position_manager, 'qmt_trader', None)
+        if qmt_trader and hasattr(qmt_trader, 'query_stock_trades'):
+            return qmt_trader.query_stock_trades()
+        return []
+
     def _on_account_callback(self, account_info):
         """
         账户资金回调函数
@@ -376,6 +417,39 @@ class TradingExecutor:
             
         except Exception as e:
             logger.error(f"处理错误回调时出错: {str(e)}")
+
+    def _get_order_cache_entry(self, order_id):
+        """从委托缓存读取记录，兼容字符串和数字订单号。"""
+        if order_id is None:
+            return None
+        candidates = [order_id, str(order_id)]
+        try:
+            candidates.append(int(order_id))
+        except (TypeError, ValueError):
+            pass
+        for candidate in candidates:
+            if candidate in self.order_cache:
+                return self.order_cache[candidate]
+        return None
+
+    def _get_order_strategy(self, order_id, default='default'):
+        """读取委托对应的策略名称。"""
+        order_info = self._get_order_cache_entry(order_id)
+        if isinstance(order_info, dict):
+            return order_info.get('strategy', default)
+        if hasattr(order_info, 'strategy'):
+            return order_info.strategy
+        return default
+
+    def _should_defer_trade_record_until_deal(self, strategy, is_simulation=None):
+        """实盘网格确认模式下，普通成交流水等真实成交回报后再写入。"""
+        if is_simulation is None:
+            is_simulation = getattr(config, 'ENABLE_SIMULATION_MODE', True)
+        return (
+            not is_simulation
+            and getattr(config, 'GRID_CONFIRM_LIVE_ORDER_BY_DEAL', True)
+            and str(strategy) == getattr(config, 'GRID_STRATEGY_NAME', 'grid')
+        )
     
     def _save_trade_record(self, stock_code, trade_time, trade_type, price, volume, amount, trade_id, commission, strategy='default'):
         """保存交易记录到数据库"""
@@ -596,40 +670,43 @@ class TradingExecutor:
     
     def get_stock_positions(self):
         """
-        获取股票持仓信息
-        
+        获取股票持仓信息 -- 统一从 PositionManager 内存 DB 取。
+
+        为什么不直接调用 xtt.query_position / self.trader.query_position?
+          xtquant.xttrader.create_trader() 不接受 path 参数，多账号场景下
+          两个进程都 import xtquant 后调用 xtt.query_position(account_id, ...)
+          可能取到错误账号的持仓（曾观测到 :5001 端口实盘模式显示 :5000
+          账号持仓的 bug，根因是 xtquant 模块级共享 trader 默认绑定某个 QMT）。
+
+          PositionManager.qmt_trader 是 easy_qmt_trader(path=config.QMT_PATH)
+          实例，带账号路径隔离；它在监控线程里把真实持仓同步到内存 DB。
+          从内存 DB 取数据：
+            - 模拟模式：唯一持仓来源（QMT 没连接）
+            - 实盘模式：经过 easy_qmt_trader 多账号隔离，最多 MONITOR_LOOP_INTERVAL
+              秒延迟（默认 3 秒）
+
         返回:
         list: 持仓信息列表
         """
         try:
-            positions = None
-            
-            # 尝试不同的API调用方式获取持仓信息
-            if self.trader and hasattr(self.trader, 'query_position'):
-                # 如果使用对象API
-                positions = self.trader.query_position()
-            elif hasattr(xtt, 'query_position'):
-                # 如果使用函数式API
-                positions = xtt.query_position(self.account_id, self.account_type)
-                
-            if not positions:
+            df = self.position_manager.get_all_positions_with_all_fields()
+            if df is None or df.empty:
                 return []
-            
-            position_list = []
-            for pos in positions:
-                position_list.append({
-                    'stock_code': pos.m_strInstrumentID,
-                    'stock_name': pos.m_strInstrumentName,
-                    'volume': pos.m_nVolume,
-                    'available': pos.m_nCanUseVolume,
-                    'cost_price': pos.m_dOpenPrice,
-                    'current_price': pos.m_dLastPrice,
-                    'market_value': pos.m_dMarketValue,
-                    'profit_ratio': pos.m_dProfitRate
+            # 只保留 web 主表需要的字段，缺失字段补默认值，
+            # 确保结构与原 QMT 路径返回一致，前端无需任何改动。
+            out = []
+            for r in df.to_dict('records'):
+                out.append({
+                    'stock_code':    r.get('stock_code', ''),
+                    'stock_name':    r.get('stock_name', '') or '',
+                    'volume':        int(r.get('volume', 0) or 0),
+                    'available':     int(r.get('available', r.get('volume', 0) or 0) or 0),
+                    'cost_price':    float(r.get('cost_price', 0) or 0),
+                    'current_price': float(r.get('current_price', 0) or 0),
+                    'market_value':  float(r.get('market_value', 0) or 0),
+                    'profit_ratio':  float(r.get('profit_ratio', 0) or 0),
                 })
-            
-            return position_list
-            
+            return out
         except Exception as e:
             logger.error(f"获取持仓信息时出错: {str(e)}")
             return []
@@ -837,9 +914,9 @@ class TradingExecutor:
                     logger.warning("当前不是交易时间，交易取消")
                     return None
 
-                # 检查全局监控总开关 - 在模拟模式下放宽限制
+                # 检查全局自动操作总开关 - 在模拟模式下放宽限制
                 # if hasattr(config, 'ENABLE_AUTO_TRADING') and not config.ENABLE_AUTO_TRADING and not is_simulation:
-                #     logger.warning("全局监控总开关已关闭，无法买入")
+                #     logger.warning("全局自动操作总开关已关闭，无法买入")
                 #     return None
                 
                 # 检查买入权限 - 在模拟模式下放宽限制
@@ -958,26 +1035,42 @@ class TradingExecutor:
                                 retry_count += 1
                                 time.sleep(1)
                                 continue
+                            # order_id=-1 表示QMT拒绝委托（账户限制/行情未就绪等），不重试不保存记录
+                            if order_id == -1:
+                                logger.error(f"[E_ORDER_BUY_REJECT] 买入 {formatted_stock_code} 被QMT拒绝 "
+                                             f"(order_id=-1, seq={returned_id}), 停止重试，不保存交易记录")
+                                order_id = None
+                                break
                         else:
                             order_id = None
 
-                        if order_id:
-                            # 添加：实盘下单成功后也立即保存交易记录
-                            trade_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            trade_saved= self._save_trade_record(
-                                stock_code=stock_code,
-                                trade_time=trade_time,
-                                trade_type='BUY',
-                                price=price,
-                                volume=volume,
-                                amount=price * volume,
-                                trade_id=f"ORDER_{order_id}",  # 使用订单ID作为交易ID
-                                commission=price * volume * 0.0003,  # 预估手续费
-                                strategy=strategy
+                        if order_id and order_id > 0:
+                            should_defer_record = self._should_defer_trade_record_until_deal(
+                                strategy,
+                                is_simulation=False
                             )
+                            trade_saved = True
+                            if should_defer_record:
+                                logger.info(
+                                    f"实盘网格买入委托已提交，等待成交回报后写入交易流水: "
+                                    f"{stock_code}, 订单号: {order_id}, 策略: {strategy}"
+                                )
+                            else:
+                                trade_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                trade_saved= self._save_trade_record(
+                                    stock_code=stock_code,
+                                    trade_time=trade_time,
+                                    trade_type='BUY',
+                                    price=price,
+                                    volume=volume,
+                                    amount=price * volume,
+                                    trade_id=f"ORDER_{order_id}",  # 使用订单ID作为交易ID
+                                    commission=price * volume * 0.0003,  # 预估手续费
+                                    strategy=strategy
+                                )
                             if trade_saved:
                                 # 缓存订单信息，供回调使用
-                                self.order_cache[order_id] = {
+                                self.order_cache[str(order_id)] = {
                                     'stock_code': stock_code,
                                     'strategy': strategy,
                                     'trade_type': 'BUY',
@@ -1209,27 +1302,43 @@ class TradingExecutor:
                                 retry_count += 1
                                 time.sleep(1)
                                 continue
+                            # order_id=-1 表示QMT拒绝委托，不重试不保存记录
+                            if order_id == -1:
+                                logger.error(f"[E_ORDER_SELL_REJECT] 卖出 {formatted_stock_code} 被QMT拒绝 "
+                                             f"(order_id=-1, seq={returned_id}), 停止重试，不保存交易记录")
+                                order_id = None
+                                break
                         else:
                             order_id = None
 
-                        if order_id:
-                            # 参考buy_stock：立即保存交易记录到数据库
-                            trade_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            trade_saved = self._save_trade_record(
-                                stock_code=stock_code,
-                                trade_time=trade_time,
-                                trade_type='SELL',
-                                price=price,
-                                volume=volume,
-                                amount=price * volume,
-                                trade_id=f"ORDER_{order_id}",  # 使用订单ID作为交易ID
-                                commission=price * volume * 0.0003,  # 预估手续费
-                                strategy=strategy
+                        if order_id and order_id > 0:
+                            should_defer_record = self._should_defer_trade_record_until_deal(
+                                strategy,
+                                is_simulation=False
                             )
-                            
+                            trade_saved = True
+                            if should_defer_record:
+                                logger.info(
+                                    f"实盘网格卖出委托已提交，等待成交回报后写入交易流水: "
+                                    f"{stock_code}, 订单号: {order_id}, 策略: {strategy}"
+                                )
+                            else:
+                                trade_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                trade_saved = self._save_trade_record(
+                                    stock_code=stock_code,
+                                    trade_time=trade_time,
+                                    trade_type='SELL',
+                                    price=price,
+                                    volume=volume,
+                                    amount=price * volume,
+                                    trade_id=f"ORDER_{order_id}",  # 使用订单ID作为交易ID
+                                    commission=price * volume * 0.0003,  # 预估手续费
+                                    strategy=strategy
+                                )
+
                             if trade_saved:
                                 # 参考buy_stock：缓存订单信息
-                                self.order_cache[order_id] = {
+                                self.order_cache[str(order_id)] = {
                                     'stock_code': stock_code,
                                     'strategy': strategy,
                                     'trade_type': 'SELL',

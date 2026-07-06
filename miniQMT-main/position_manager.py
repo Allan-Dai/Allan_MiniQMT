@@ -10,7 +10,6 @@ import threading
 import sys
 import os
 import json
-import Methods
 import config
 from logger import get_logger
 from data_manager import get_data_manager
@@ -41,6 +40,7 @@ def _create_qmt_trader():
         )
     else:
         account_config = config.get_account_config()
+        logger.info(f"从配置管理器获取账户信息: account_id={account_config.get('account_id')}, account_type={account_config.get('account_type')}")
         return easy_qmt_trader(
             path=config.QMT_PATH,
             account=account_config.get("account_id"),
@@ -82,6 +82,8 @@ class PositionManager:
                 self.qmt_connected = True
                 # P0修复: 注册成交回报回调，成交时立即从pending_orders移除跟踪
                 self.qmt_trader.register_trade_callback(self._on_trade_callback)
+                if hasattr(self.qmt_trader, 'register_order_callback'):
+                    self.qmt_trader.register_order_callback(self._on_order_callback)
                 # Fail-Safe: 注册断连回调，QMT崩溃时立即标记 qmt_connected=False
                 self.qmt_trader.register_disconnect_callback(self._on_qmt_disconnect)
 
@@ -135,6 +137,9 @@ class PositionManager:
         self.pending_orders = {}  # 存储待处理的委托单: {stock_code: {'order_id', 'submit_time', 'signal_type', ...}}
         self.order_check_interval = 30  # 委托单检查间隔（秒）
         self.last_order_check_time = 0
+        self.callback_refresh_lock = threading.Lock()
+        self.last_callback_refresh_time = 0
+        self.callback_refresh_min_interval = 2.0
 
         # ========= 行情异常兜底（风险保护） =========
         self.market_data_failures = {}  # {stock_code: 连续失败次数}
@@ -147,6 +152,8 @@ class PositionManager:
         self._deleting_stocks = set()  # 正在删除的股票代码集合
 
         # 网格交易数据库管理器(用于网格交易会话和记录)
+        self._cleared_position_cost_warning_ts = {}
+
         if config.ENABLE_GRID_TRADING:
             try:
                 from grid_database import DatabaseManager
@@ -210,7 +217,18 @@ class PositionManager:
         if config.ENABLE_SIMULATION_MODE:
             return True
         if getattr(config, 'ENABLE_XTQUANT_MANAGER', False):
-            return False  # XtQuantManager 有自己的重连机制
+            # XtQuantManager 模式：服务端重连由 HealthMonitor 负责。
+            # 但客户端 qmt_trader（XtQuantClient）若未初始化（模拟→实盘切换），
+            # 仍需在此创建，否则持仓查询等调用全部返回 None。
+            if self.qmt_trader is None:
+                try:
+                    self.qmt_trader = _create_qmt_trader()
+                    self.qmt_connected = True
+                    logger.info("[RECONNECT] XtQuantManager 模式: 已创建 XtQuantClient")
+                except Exception as e:
+                    logger.error(f"[RECONNECT] 创建 XtQuantClient 失败: {e}")
+                    self.qmt_connected = False
+            return self.qmt_connected
 
         if self.qmt_trader is None:
             try:
@@ -243,6 +261,12 @@ class PositionManager:
                     except Exception as e:
                         logger.warning(f'[RECONNECT] 重新注册 trade_callback 失败 (非致命): {e}')
                     # 重新注册断连回调
+                    try:
+                        if hasattr(self.qmt_trader, 'register_order_callback'):
+                            self.qmt_trader.register_order_callback(self._on_order_callback)
+                            logger.info('[RECONNECT] 已重新注册 order_callback')
+                    except Exception as e:
+                        logger.warning(f'[RECONNECT] 重新注册 order_callback 失败 (非致命): {e}')
                     try:
                         self.qmt_trader.register_disconnect_callback(self._on_qmt_disconnect)
                         logger.info('[RECONNECT] 已重新注册 disconnect_callback')
@@ -326,6 +350,37 @@ class PositionManager:
             # 不应因上次重连失败留下的冷却时间而延误本轮恢复
             self._last_reconnect_time = 0.0
             logger.info('[DISCONNECT] 已重置重连冷却计时，下次监控循环可立即触发重连')
+
+    def _request_immediate_position_refresh(self, stock_code, reason):
+        """成交/委托终态后异步刷新一次持仓，缩短 QMT 同步窗口。"""
+        try:
+            if getattr(config, 'ENABLE_SIMULATION_MODE', False) or self.qmt_trader is None:
+                return
+
+            now = time.time()
+            with self.callback_refresh_lock:
+                if now - self.last_callback_refresh_time < self.callback_refresh_min_interval:
+                    logger.debug(f"[POSITION_REFRESH] {stock_code} {reason} 距上次刷新过近，跳过")
+                    return
+                self.last_callback_refresh_time = now
+
+            def _refresh():
+                try:
+                    self.last_position_update_time = 0
+                    positions = self.get_all_positions()
+                    self._increment_data_version()
+                    count = 0 if positions is None else len(positions)
+                    logger.info(f"[POSITION_REFRESH] {stock_code} {reason} 后已触发持仓快刷，当前缓存 {count} 条")
+                except Exception as refresh_err:
+                    logger.warning(f"[POSITION_REFRESH] {stock_code} {reason} 持仓快刷失败: {refresh_err}")
+
+            threading.Thread(
+                target=_refresh,
+                name=f"PositionRefresh-{stock_code}",
+                daemon=True
+            ).start()
+        except Exception as e:
+            logger.warning(f"[POSITION_REFRESH] {stock_code} {reason} 调度失败: {e}")
 
     def _increment_data_version(self):
         """递增数据版本号（内部方法）"""
@@ -468,8 +523,14 @@ class PositionManager:
                                 current_price=current_price,
                                 open_date=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             )
-                            # 实盘新增持仓：确保已订阅到 xtdata 实时推送
-                            self.data_manager.ensure_subscribed(stock_code)
+
+                        # 实盘持仓（无论新旧）都确保已订阅到 xtdata 实时推送。
+                        # 否则 get_full_tick 拿不到实时 tick → current_price 停滞
+                        # → data_version 不增 → SSE 推 changed=false → 前端不刷新。
+                        # ensure_subscribed 对已订阅股票幂等短路，无额外开销。
+                        # （原先仅在"新增持仓"分支订阅，启动后已存在的持仓若不在
+                        #   STOCK_POOL 中则永不订阅，是实盘 P&L 长期不刷新的根因。）
+                        self.data_manager.ensure_subscribed(stock_code)
 
                         # 添加到当前持仓集合
                         current_positions.add(stock_code)
@@ -1152,6 +1213,18 @@ class PositionManager:
         except Exception as e:
             logger.error(f"更新出错 {self.stock_positions_file}: {str(e)}")
 
+    def _log_cleared_position_cost_warning(self, stock_code, message):
+        """对清仓残留持仓的成本价告警限频，避免非交易时段刷屏。"""
+        interval = getattr(config, 'CLEARED_POSITION_WARNING_INTERVAL', 1800)
+        now = time.time()
+        last_ts = self._cleared_position_cost_warning_ts.get(stock_code, 0)
+
+        if interval <= 0 or (now - last_ts) >= interval:
+            logger.warning(message)
+            self._cleared_position_cost_warning_ts[stock_code] = now
+        else:
+            logger.debug(message)
+
     def update_position(self, stock_code, volume, cost_price, current_price=None,
                    profit_ratio=None, market_value=None, available=None, open_date=None,
                    profit_triggered=None, highest_price=None, stop_loss_price=None,
@@ -1206,10 +1279,16 @@ class PositionManager:
                                 logger.info(f"{stock_code} 持仓已清空,从数据库保留cost_price: {final_cost_price:.2f}")
                             else:
                                 final_cost_price = 0.0
-                                logger.warning(f"{stock_code} 持仓已清空且无有效成本价,设为0(建议删除此持仓记录)")
+                                self._log_cleared_position_cost_warning(
+                                    stock_code,
+                                    f"{stock_code} 持仓已清空且无有效成本价,设为0(建议删除此持仓记录)"
+                                )
                         else:
                             final_cost_price = 0.0
-                            logger.warning(f"{stock_code} 持仓已清空且数据库无记录,成本价设为0")
+                            self._log_cleared_position_cost_warning(
+                                stock_code,
+                                f"{stock_code} 持仓已清空且数据库无记录,成本价设为0"
+                            )
                     except Exception as e:
                         logger.error(f"{stock_code} 查询数据库历史成本时出错: {e}")
                         final_cost_price = 0.0
@@ -1263,12 +1342,25 @@ class PositionManager:
             # 获取当前时间
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+            def _fmt_optional_price(value):
+                return f"{value:.2f}" if value is not None else "None"
+
+            def _is_valid_stock_name(name):
+                if name is None:
+                    return False
+                name = str(name).strip()
+                if not name or name in ('--', 'None', 'nan'):
+                    return False
+                stock_code_simple = str(stock_code).split('.')[0]
+                name_simple = name.split('.')[0] if '.' in name else name
+                return name_simple != stock_code_simple
+
             with self.memory_conn_lock:
                 cursor = self.memory_conn.cursor()
 
                 # P0修复: 不修改全局row_factory，使用cursor.description手动构建字典
                 dict_cursor = self.memory_conn.cursor()
-                dict_cursor.execute("SELECT open_date, profit_triggered, highest_price, cost_price, stop_loss_price FROM positions WHERE stock_code=?", (stock_code,))
+                dict_cursor.execute("SELECT open_date, profit_triggered, highest_price, cost_price, stop_loss_price, stock_name FROM positions WHERE stock_code=?", (stock_code,))
                 row = dict_cursor.fetchone()
 
                 # 手动构建字典以避免修改全局row_factory
@@ -1324,6 +1416,13 @@ class PositionManager:
                         calculated_slp = self.calculate_stop_loss_price(final_cost_price, final_highest_price, final_profit_triggered)
                         final_stop_loss_price = round(calculated_slp, 2) if calculated_slp is not None else None
 
+                    existing_stock_name = result_row.get('stock_name')
+                    final_stock_name = stock_name
+                    if not _is_valid_stock_name(final_stock_name) and _is_valid_stock_name(existing_stock_name):
+                        final_stock_name = existing_stock_name
+                    elif not _is_valid_stock_name(final_stock_name):
+                        final_stock_name = stock_code
+
 
                     # 使用普通cursor执行更新
                     # 修复：同步更新 base_cost_price，确保加仓后"基准成本"字段保持最新
@@ -1333,15 +1432,15 @@ class PositionManager:
                             profit_ratio=?, last_update=?, highest_price=?, stop_loss_price=?, profit_triggered=?, stock_name=?
                         WHERE stock_code=?
                     """, (int(p_volume), final_cost_price, p_base_cost_price, final_current_price, p_market_value, int(p_available),
-                        p_profit_ratio, now, final_highest_price, final_stop_loss_price, final_profit_triggered, stock_name, stock_code))
+                        p_profit_ratio, now, final_highest_price, final_stop_loss_price, final_profit_triggered, final_stock_name, stock_code))
 
                     # 【关键修改】使用字典访问记录变化
                     if final_profit_triggered != existing_profit_triggered:
                         logger.info(f"更新 {stock_code} 持仓: 首次止盈触发: 从 {existing_profit_triggered} 到 {final_profit_triggered}")
                     elif abs(final_highest_price - (old_db_highest_price or 0)) > 0.01:
-                        logger.info(f"更新 {stock_code} 持仓: 最高价: 从 {old_db_highest_price:.2f} 到 {final_highest_price:.2f}")
+                        logger.info(f"更新 {stock_code} 持仓: 最高价: 从 {_fmt_optional_price(old_db_highest_price)} 到 {_fmt_optional_price(final_highest_price)}")
                     elif final_stop_loss_price != (float(result_row['stop_loss_price']) if result_row['stop_loss_price'] is not None else None):  # 替代 result[3]
-                        logger.info(f"更新 {stock_code} 持仓: 止损价: 从 {result_row['stop_loss_price']:.2f} 到 {final_stop_loss_price:.2f}")
+                        logger.info(f"更新 {stock_code} 持仓: 止损价: 从 {_fmt_optional_price(result_row['stop_loss_price'])} 到 {_fmt_optional_price(final_stop_loss_price)}")
 
                 else:
                     # 新增持仓（保持原有逻辑不变）
@@ -1357,7 +1456,7 @@ class PositionManager:
                     calculated_slp = self.calculate_stop_loss_price(final_cost_price, final_highest_price, profit_triggered)
                     final_stop_loss_price = round(calculated_slp, 2) if calculated_slp is not None else None
 
-                    if stock_name is None:
+                    if not _is_valid_stock_name(stock_name):
                         stock_name = stock_code
 
                     cursor.execute("""
@@ -1367,7 +1466,7 @@ class PositionManager:
                     """, (stock_code, stock_name, int(p_volume), final_cost_price, p_base_cost_price, final_current_price, p_market_value,
                         int(p_available), p_profit_ratio, now, open_date, profit_triggered, final_highest_price, final_stop_loss_price))
 
-                    logger.info(f"新增 {stock_code} 持仓: 数量={p_volume}, 成本价={final_cost_price:.2f}, 最高价={final_highest_price:.2f}, 止损价={final_stop_loss_price:.2f}")
+                    logger.info(f"新增 {stock_code} 持仓: 数量={p_volume}, 成本价={_fmt_optional_price(final_cost_price)}, 最高价={_fmt_optional_price(final_highest_price)}, 止损价={_fmt_optional_price(final_stop_loss_price)}")
 
                 # P0修复: commit操作（移除finally块和row_factory恢复）
                 self.memory_conn.commit()
@@ -1522,12 +1621,11 @@ class PositionManager:
                     # 如果本地无数据，才尝试从行情接口拉取（日线）
                     if highest_price <= 0:
                         try:
-                            history_data = Methods.getStockData(
-                                code=stock_code,
-                                fields="high",
-                                start_date=open_date_formatted,
-                                freq='d',  # 日线
-                                adjustflag='2'
+                            history_data = self.data_manager.download_history_data(
+                                stock_code,
+                                period='1d',
+                                start_date=open_date_formatted.replace('-', ''),
+                                end_date=today_formatted.replace('-', '')
                             )
                             if history_data is not None and not history_data.empty:
                                 highest_price = history_data['high'].astype(float).max()
@@ -1631,9 +1729,12 @@ class PositionManager:
                         if latest_quote and isinstance(latest_quote, dict) and 'lastPrice' in latest_quote and latest_quote['lastPrice'] is not None:
                             current_price = float(latest_quote['lastPrice'])
 
-                            # 只有价格有显著变化时才更新
+                            # 只有价格真实变化时才更新（实盘下原 0.3% 比例阈值过高，
+                            # 盘中 A 股单 tick 难以触发，导致 data_version 长时间不增、
+                            # SSE 不推送 changed=true，前端持仓刷新被卡在 60 秒兜底轮询。
+                            # 改为 1 分钱绝对阈值——A 股最小 tick——盘中能正常驱动版本号。）
                             old_price = safe_numeric_values['current_price']
-                            if abs(current_price - old_price) / max(old_price, 0.01) > 0.003:  # 防止除零
+                            if abs(current_price - old_price) >= 0.01:
                                 # 使用安全转换后的值来更新
                                 self.update_position(
                                     stock_code=stock_code,
@@ -1679,14 +1780,19 @@ class PositionManager:
                             except (ValueError, TypeError):
                                 # 忽略无效值
                                 pass
-                
+
                 # 计算总资产
                 available = float(config.SIMULATION_BALANCE)
                 total_asset = available + market_value  # 可用资金 + 持仓市值
-                
+
+                # 多账号场景下需要返回真实的 account_id 才能在 Web UI 上区分不同窗口；
+                # 模拟身份由 /api/status 的 settings.simulationMode 字段独立表达。
+                real_account_id   = config.ACCOUNT_CONFIG.get('account_id') or 'SIMULATION'
+                real_account_type = config.ACCOUNT_CONFIG.get('account_type') or 'SIMULATION'
+
                 return {
-                    'account_id': 'SIMULATION',
-                    'account_type': 'SIMULATION',
+                    'account_id': real_account_id,
+                    'account_type': real_account_type,
                     'available': available,
                     'market_value': float(market_value),
                     'total_asset': total_asset,  # 添加总资产字段
@@ -2144,6 +2250,22 @@ class PositionManager:
                         pullback_ratio = (breakout_highest_price - current_price) / breakout_highest_price
                         
                         if pullback_ratio >= config.INITIAL_TAKE_PROFIT_PULLBACK_RATIO:
+                            min_take_profit_price = self._get_initial_take_profit_min_valid_price(cost_price)
+                            if min_take_profit_price > 0 and current_price < min_take_profit_price:
+                                logger.warning(
+                                    f"{stock_code} 回撤止盈信号已失效: 当前价格 {current_price:.2f} "
+                                    f"< 最低有效止盈价 {min_take_profit_price:.2f}，清除突破状态，等待重新突破"
+                                )
+                                self._reset_profit_breakout(stock_code, "below_initial_take_profit_floor")
+                                return None, None
+
+                            if available <= 0:
+                                logger.warning(
+                                    f"{stock_code} 已满足回撤止盈但当前可卖数量为0，暂不生成半仓止盈信号 "
+                                    f"(volume={volume}, available={available})"
+                                )
+                                return None, None
+
                             logger.info(f"{stock_code} 触发回撤止盈，突破后最高价: {breakout_highest_price:.2f}, "
                                     f"当前价格: {current_price:.2f}, 回撤: {pullback_ratio:.2%}")
 
@@ -2215,7 +2337,7 @@ class PositionManager:
             return None, None
 
 
-    def validate_trading_signal(self, stock_code, signal_type, signal_info):
+    def validate_trading_signal(self, stock_code, signal_type, signal_info, return_reason=False):
         """
         交易信号最后验证 - 防止异常信号执行
 
@@ -2226,7 +2348,13 @@ class PositionManager:
 
         返回:
         bool: 是否通过验证
+        return_reason=True 时返回 (是否通过, 状态, 原因)，状态为 passed/blocked/failed
         """
+        def _result(ok, status="passed", reason=""):
+            if return_reason:
+                return ok, status, reason
+            return ok
+
         try:
             # 全仓止盈信号是否允许跳过活跃委托单检查（默认不允许）
             allow_skip_pending_check = (
@@ -2249,7 +2377,7 @@ class PositionManager:
                         if self._has_pending_orders(stock_code):
                             logger.warning(f"[待委托拦截] {stock_code} 存在未成交委托单，跳过本次信号执行（委托处理中，非错误）")
                             logger.warning(f"   等待委托单成交或撤销后，信号将自动重试")
-                            return False
+                            return _result(False, "blocked", "pending_order")
                         else:
                             logger.warning(f"警告 {stock_code} 未检测到活跃委托单，但available=0")
                             logger.warning(f"   可能原因: 1)委托单刚成交 2)系统数据未同步 3)其他原因")
@@ -2258,7 +2386,7 @@ class PositionManager:
                             logger.error(f"   原因：可能存在未成交委托单或数据同步延迟")
                             logger.error(f"   建议：等待委托单处理完毕或手动确认持仓状态")
                             logger.error(f"   修复说明：此为保守策略，避免在不确定情况下执行交易")
-                            return False
+                            return _result(False, "blocked", "available_zero_sync_delay")
             else:
                 # 全仓止盈信号: 允许跳过活跃委托单检查（受配置控制）
                 logger.warning(
@@ -2275,25 +2403,25 @@ class PositionManager:
                 if current_price <= 0 or cost_price <= 0 or stop_loss_price <= 0:
                     logger.error(f"🚨 {stock_code} 止损信号数据包含无效值，拒绝执行")
                     logger.error(f"   current_price={current_price:.2f}, cost_price={cost_price:.2f}, stop_loss_price={stop_loss_price:.2f}")
-                    return False
+                    return _result(False, "failed", "invalid_stop_loss_data")
 
                 # 🔑 价格比例检查 - 防止字段错乱导致的异常
                 stop_ratio = stop_loss_price / cost_price
                 if stop_ratio > 1.5 or stop_ratio < 0.5:
                     logger.error(f"🚨 {stock_code} 止损价比例异常 {stop_ratio:.3f}，疑似字段错乱，拒绝执行")
-                    return False
+                    return _result(False, "failed", "invalid_stop_loss_ratio")
 
                 # 🔑 亏损比例检查
                 loss_ratio = (cost_price - current_price) / cost_price
                 if loss_ratio < 0.02:  # 亏损小于2%
                     logger.error(f"🚨 {stock_code} 亏损比例过小 {loss_ratio:.2%}，可能是误触发，拒绝执行")
-                    return False
+                    return _result(False, "failed", "loss_ratio_too_small")
 
                 # 🔑 异常值检查
                 if current_price > cost_price * 10 or stop_loss_price > cost_price * 10:
                     logger.error(f"🚨 {stock_code} 价格数据异常，疑似单位错误，拒绝执行")
                     logger.error(f"   current_price={current_price:.2f}, stop_loss_price={stop_loss_price:.2f}, cost_price={cost_price:.2f}")
-                    return False
+                    return _result(False, "failed", "abnormal_price_data")
 
                 logger.info(f"✅ {stock_code} 止损信号验证通过: 亏损{loss_ratio:.2%}, 止损比例{stop_ratio:.3f}")
 
@@ -2303,7 +2431,7 @@ class PositionManager:
 
                 if current_price <= 0 or signal_cost_price <= 0:
                     logger.error(f"🚨 {stock_code} 止盈信号数据无效，拒绝执行")
-                    return False
+                    return _result(False, "failed", "invalid_take_profit_data")
 
                 # ⭐ 修复: 验证时重新获取实时成本价,避免使用历史base_cost
                 position = self.get_position(stock_code)
@@ -2326,15 +2454,25 @@ class PositionManager:
                 if current_price <= cost_price:
                     logger.error(f"🚨 {stock_code} 止盈信号但当前亏损 {profit_ratio:.2%}，拒绝执行")
                     logger.error(f"   成本价: {cost_price:.2f}, 当前价: {current_price:.2f}")
-                    return False
+                    return _result(False, "failed", "take_profit_not_profitable")
+
+                if signal_type == 'take_profit_half':
+                    min_take_profit_price = self._get_initial_take_profit_min_valid_price(cost_price)
+                    if min_take_profit_price > 0 and current_price < min_take_profit_price:
+                        logger.error(
+                            f"🚨 {stock_code} 半仓止盈信号已失效，当前价 {current_price:.2f} "
+                            f"< 最低有效止盈价 {min_take_profit_price:.2f}，拒绝执行"
+                        )
+                        self._reset_profit_breakout(stock_code, "validate_below_initial_take_profit_floor")
+                        return _result(False, "failed", "take_profit_signal_expired")
 
                 logger.info(f"✅ {stock_code} 止盈信号验证通过，盈利 {profit_ratio:.2%}")
 
-            return True
+            return _result(True)
 
         except Exception as e:
             logger.error(f"🚨 {stock_code} 信号验证失败: {e}")
-            return False
+            return _result(False, "failed", "validation_exception")
 
     def _get_real_order_id(self, returned_id):
         """
@@ -3115,14 +3253,58 @@ class PositionManager:
 
                 if cursor.rowcount > 0:
                     logger.debug(f"{stock_code} 标记突破状态成功")
+                    # BUG-1修复: 立即失效缓存，防止监控循环在10秒TTL内读到旧的
+                    # profit_breakout_triggered=False，导致"首次突破"日志重复输出
+                    self.positions_cache = None
                     return True
                 else:
                     logger.warning(f"{stock_code} 标记突破状态失败，未找到记录")
                     return False
-                    
+
         except Exception as e:
             logger.error(f"标记 {stock_code} 突破状态失败: {str(e)}")
             return False
+
+    def _reset_profit_breakout(self, stock_code, reason=""):
+        """清除首次止盈突破状态，避免过期回撤信号跨日继续执行。"""
+        try:
+            with self.memory_conn_lock:
+                cursor = self.memory_conn.cursor()
+                cursor.execute("""
+                    UPDATE positions
+                    SET profit_breakout_triggered = ?, breakout_highest_price = ?
+                    WHERE stock_code = ?
+                """, (False, 0.0, stock_code))
+                self.memory_conn.commit()
+
+                if cursor.rowcount > 0:
+                    self.positions_cache = None
+                    reason_text = f"（原因: {reason}）" if reason else ""
+                    logger.info(f"{stock_code} 首次止盈突破状态已清除{reason_text}")
+                    return True
+
+                logger.warning(f"{stock_code} 清除突破状态失败，未找到记录")
+                return False
+
+        except Exception as e:
+            logger.error(f"清除 {stock_code} 突破状态失败: {str(e)}")
+            return False
+
+    def _get_initial_take_profit_min_valid_price(self, cost_price):
+        """首次止盈回撤信号的最低有效价格，允许一个回撤阈值的行情采样滑点。"""
+        try:
+            cost_price = float(cost_price)
+            if cost_price <= 0:
+                return 0.0
+
+            take_profit_ratio = getattr(config, 'INITIAL_TAKE_PROFIT_RATIO', 0.0)
+            pullback_ratio = getattr(config, 'INITIAL_TAKE_PROFIT_PULLBACK_RATIO', 0.0)
+            trigger_floor = cost_price * (1 + take_profit_ratio) * (1 - pullback_ratio)
+            return trigger_floor * (1 - pullback_ratio)
+
+        except (TypeError, ValueError) as e:
+            logger.error(f"计算首次止盈最低有效价格失败: {e}")
+            return 0.0
 
     def _update_breakout_highest_price(self, stock_code, new_highest_price):
         """更新突破后最高价 - 修正版本"""
@@ -3229,6 +3411,9 @@ class PositionManager:
                 cursor.execute("UPDATE positions SET profit_triggered = ? WHERE stock_code = ?", (True, stock_code))
                 self.memory_conn.commit()
             logger.info(f"已标记 {stock_code} profit_triggered已标记为True")
+            # BUG-1修复: 立即失效缓存，防止监控循环在10秒TTL内读到旧的
+            # profit_triggered=False，导致止盈信号在已标记True后仍被重复生成
+            self.positions_cache = None
             return True
         except Exception as e:
             logger.error(f"标记 {stock_code} profit_triggered时出错: {str(e)}")
@@ -3582,84 +3767,54 @@ class PositionManager:
                         if current_price <= 0:
                             logger.warning(f"{stock_code} 价格无效: {current_price:.2f},跳过本次检查")
                             continue
+                        if not self.data_manager.is_quote_tradable(stock_code, latest_quote):
+                            logger.warning(
+                                f"[MARKET_HEALTH] {stock_code} 行情健康度不足，跳过信号检测 "
+                                f"(source={latest_quote.get('_source')}, "
+                                f"score={latest_quote.get('_health_score')})"
+                            )
+                            continue
                     except Exception as e:
                         logger.error(f"{stock_code} 获取行情异常: {e}")
                         continue
 
-                    # 调试日志
-                    logger.debug(f"[MONITOR_CALL] 开始检查 {stock_code} 的交易信号 (价格: {current_price:.2f})")
+                    global_monitor_enabled = config.is_global_monitor_enabled()
+                    if not global_monitor_enabled:
+                        with self.signal_lock:
+                            self.latest_signals.pop(stock_code, None)
+                        logger.debug(f"[MONITOR_CALL] 全局自动操作总开关关闭，跳过 {stock_code} 自动策略检测")
+                    else:
+                        # 调试日志
+                        logger.debug(f"[MONITOR_CALL] 开始检查 {stock_code} 的交易信号 (价格: {current_price:.2f})")
 
-                    # 使用统一的信号检查函数 (传入价格,避免内部重复调用API)
-                    signal_type, signal_info = self.check_trading_signals(stock_code, current_price)
-                    force_grid_stop = False
+                        # 动态止盈止损只写入自身信号队列，不再与网格信号共享。
+                        signal_type, signal_info = self.check_trading_signals(stock_code, current_price)
 
-                    with self.signal_lock:
-                        if signal_type:
-                            existing_signal = self.latest_signals.get(stock_code)
-
-                            # 🔑 信号优先级体系: stop_loss > grid_* > take_profit_*
-                            # 止损信号优先级最高,可以覆盖任何信号
-                            if signal_type == 'stop_loss':
-                                force_grid_stop = True
-                                self.latest_signals[stock_code] = {
-                                    'type': signal_type,
-                                    'info': signal_info,
-                                    'timestamp': datetime.now()
-                                }
-                                logger.info(f"🔔 {stock_code} 检测到止损信号(最高优先级),覆盖已有信号")
-                            # 普通止盈信号不能覆盖网格信号
-                            elif existing_signal and existing_signal.get('type') in ['grid_buy', 'grid_sell']:
-                                logger.info(f"{stock_code} 已有网格信号 {existing_signal.get('type')},跳过止盈信号 {signal_type}")
-                            else:
+                        with self.signal_lock:
+                            if signal_type:
                                 self.latest_signals[stock_code] = {
                                     'type': signal_type,
                                     'info': signal_info,
                                     'timestamp': datetime.now()
                                 }
                                 logger.info(f"🔔 {stock_code} 检测到信号: {signal_type},等待策略处理")
-                        else:
-                            # 清除已不存在的信号（但保留网格信号，网格信号由网格检测逻辑管理）
-                            # 已在锁保护范围内，无需再次获取
-                            existing = self.latest_signals.get(stock_code)
-                            if existing and existing.get('type', '').startswith('grid_'):
-                                pass  # 保留网格信号，不清除
                             else:
                                 self.latest_signals.pop(stock_code, None)
 
-                    # ===== 网格交易信号检测 (使用已获取的价格) =====
-                    # 网格信号检测应该独立于止盈止损信号
-                    # ===== ç¡¬ä¼åçº§ï¼stop_loss è§¦åæ¶ç«å³å¼ºå¶éåºç½æ ¼ä¼è¯ï¼éå¤æ§è¡ï¼ =====
-                    if force_grid_stop and self.grid_manager and config.ENABLE_GRID_TRADING:
-                        try:
-                            normalized = self.grid_manager._normalize_code(stock_code)
-                            session = self.grid_manager.sessions.get(normalized)
-                            if session and session.status == 'active':
-                                self.grid_manager.stop_grid_session(session.id, 'stop_loss')
-                                logger.warning(f"[GRID] {stock_code} æ­¢æè§¦åï¼å·²å¼ºå¶åæ­¢ç½æ ¼ä¼è¯ session_id={session.id}")
-                        except Exception as e:
-                            logger.warning(f"[GRID] {stock_code} æ­¢æè§¦åå¼ºå¶åä¼è¯å¤±è´¥(å¯å¿½ç¥): {e}")
-
-                    if self.grid_manager and config.ENABLE_GRID_TRADING:
-                        try:
-                            grid_signal = self.grid_manager.check_grid_signals(stock_code, current_price)
-                            if grid_signal:
-                                # 转换信号格式：'BUY' -> 'grid_buy', 'SELL' -> 'grid_sell'
-                                grid_signal_type = f"grid_{grid_signal['signal_type'].lower()}"
-                                with self.signal_lock:
-                                    # 🔑 信号优先级保护: stop_loss > grid_* > take_profit_*
-                                    existing = self.latest_signals.get(stock_code)
-                                    # 止损信号优先级最高,不被网格信号覆盖
-                                    if existing and existing.get('type') == 'stop_loss':
-                                        logger.warning(f"[GRID] {stock_code} 已有止损信号,网格信号 {grid_signal_type} 不覆盖")
+                        # 网格交易独立检测并直接执行，不进入 latest_signals/strategy 动态止盈链路。
+                        if self.grid_manager and config.ENABLE_GRID_TRADING:
+                            try:
+                                grid_signal = self.grid_manager.check_grid_signals(stock_code, current_price)
+                                if grid_signal:
+                                    grid_signal_type = f"grid_{grid_signal['signal_type'].lower()}"
+                                    logger.info(f"[GRID] {stock_code} 检测到网格信号: {grid_signal_type}")
+                                    success = self.grid_manager.execute_grid_trade(grid_signal)
+                                    if success:
+                                        logger.info(f"[GRID] {stock_code} 网格交易执行成功: {grid_signal_type}")
                                     else:
-                                        self.latest_signals[stock_code] = {
-                                            'type': grid_signal_type,
-                                            'info': grid_signal,
-                                            'timestamp': datetime.now()
-                                        }
-                                        logger.info(f"[GRID] {stock_code} 检测到网格信号: {grid_signal_type}")
-                        except Exception as e:
-                            logger.error(f"[GRID] {stock_code} 网格信号检测异常: {e}")
+                                        logger.warning(f"[GRID] {stock_code} 网格交易执行失败: {grid_signal_type}")
+                            except Exception as e:
+                                logger.error(f"[GRID] {stock_code} 网格信号检测/执行异常: {e}")
 
                     # 更新最高价（如果当前价格更高,使用已获取的价格）
                     try:
@@ -3742,8 +3897,32 @@ class PositionManager:
                             args=(stock_code_short,),
                             daemon=True
                         ).start()
+
+            self._request_immediate_position_refresh(stock_code_short, "成交回报")
+
+            # 网格实盘委托只在成交回报到达后确认落账
+            grid_manager = getattr(self, 'grid_manager', None)
+            if getattr(config, 'ENABLE_GRID_TRADING', False) and grid_manager:
+                try:
+                    grid_manager.handle_deal_callback(trade)
+                except Exception as grid_err:
+                    logger.warning(f"[GRID] 成交回调确认网格委托失败: {grid_err}")
         except Exception as e:
             logger.error(f"_on_trade_callback 处理异常: {e}")
+
+    def _on_order_callback(self, order):
+        """QMT委托状态回调：将撤单、废单等终态转发给网格管理器。"""
+        try:
+            order_status = getattr(order, 'order_status', None)
+            stock_code = str(getattr(order, 'stock_code', '') or '')[:6]
+            if stock_code and order_status not in [48, 49, 50, 51, 52, 55]:
+                self._request_immediate_position_refresh(stock_code, f"委托终态({order_status})")
+
+            grid_manager = getattr(self, 'grid_manager', None)
+            if getattr(config, 'ENABLE_GRID_TRADING', False) and grid_manager:
+                grid_manager.handle_order_callback(order)
+        except Exception as e:
+            logger.warning(f"[GRID] 委托状态回调处理失败: {e}")
 
     def _sync_profit_triggered_to_sqlite(self, stock_code):
         """P1修复: 立即将内存中的profit_triggered=True同步到SQLite，不等待定时同步"""
@@ -3785,6 +3964,16 @@ class PositionManager:
         except Exception as e:
             logger.error(f"跟踪委托单失败: {str(e)}")
 
+    def _get_pending_order_timeout_minutes(self, signal_type):
+        """按信号类型获取委托超时阈值，止损单使用更短等待时间。"""
+        if signal_type == 'stop_loss':
+            return float(getattr(
+                config,
+                'STOP_LOSS_PENDING_ORDER_TIMEOUT_MINUTES',
+                config.PENDING_ORDER_TIMEOUT_MINUTES
+            ))
+        return float(config.PENDING_ORDER_TIMEOUT_MINUTES)
+
     def check_pending_orders_timeout(self):
         """
         检查所有待处理委托单是否超时
@@ -3812,11 +4001,15 @@ class PositionManager:
             with self.pending_orders_lock:
                 for stock_code, order_info in list(self.pending_orders.items()):
                     submit_time = order_info['submit_time']
+                    signal_type = order_info.get('signal_type')
+                    timeout_minutes = self._get_pending_order_timeout_minutes(signal_type)
                     elapsed_minutes = (datetime.now() - submit_time).total_seconds() / 60
 
                     # 检查是否超时
-                    if elapsed_minutes >= config.PENDING_ORDER_TIMEOUT_MINUTES:
-                        timeout_orders.append(order_info)
+                    if elapsed_minutes >= timeout_minutes:
+                        timeout_info = dict(order_info)
+                        timeout_info['timeout_minutes'] = timeout_minutes
+                        timeout_orders.append(timeout_info)
 
             # 处理超时委托单
             for order_info in timeout_orders:
@@ -3838,10 +4031,14 @@ class PositionManager:
             signal_type = order_info['signal_type']
             signal_info = order_info['signal_info']
             submit_time = order_info['submit_time']
+            timeout_minutes = order_info.get(
+                'timeout_minutes',
+                self._get_pending_order_timeout_minutes(signal_type)
+            )
             elapsed = (datetime.now() - submit_time).total_seconds() / 60
 
             logger.warning(f"⏰ [E_ORDER_TIMEOUT_001] {stock_code} 委托单超时: order_id={order_id}, "
-                         f"信号类型={signal_type}, 已等待{elapsed:.1f}分钟 (超时阈值={config.PENDING_ORDER_TIMEOUT_MINUTES}分钟)，"
+                         f"信号类型={signal_type}, 已等待{elapsed:.1f}分钟 (超时阈值={timeout_minutes}分钟)，"
                          f"将查询当前状态并决定是否自动撤单")
 
             # 查询委托单当前状态
@@ -4083,6 +4280,12 @@ class PositionManager:
             return
 
         try:
+            if self.db_manager is None:
+                from grid_database import DatabaseManager
+                self.db_manager = DatabaseManager()
+                self.db_manager.init_grid_tables()
+                logger.info("网格交易数据库管理器延迟初始化完成")
+
             from grid_trading_manager import GridTradingManager
             new_manager = GridTradingManager(
                 self.db_manager,

@@ -22,7 +22,36 @@ for _i, _arg in enumerate(_argv):
 # ─────────────────────────────────────────────────────────
 
 import config
+
+# ── 设置控制台窗口标题 + 写入 PID 文件（供 menu.bat / scripts/_launcher.py 跟踪进程）──
+def _setup_window_and_pid():
+    _aid = os.environ.get('QMT_ACCOUNT_ID', '').strip()
+    if sys.platform == 'win32' and _aid:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(f"miniQMT [{_aid}]")
+        except Exception:
+            pass
+    try:
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+        pid_file = os.path.join(config.DATA_DIR, "pid.txt")
+        with open(pid_file, 'w', encoding='ascii') as f:
+            f.write(str(os.getpid()))
+        import atexit
+        def _cleanup_pid():
+            try:
+                if os.path.exists(pid_file):
+                    os.remove(pid_file)
+            except Exception:
+                pass
+        atexit.register(_cleanup_pid)
+    except Exception:
+        pass
+
+_setup_window_and_pid()
+
 from logger import get_logger, schedule_log_cleanup, clean_old_logs
+from maintenance import schedule_database_maintenance
 from data_manager import get_data_manager
 from indicator_calculator import get_indicator_calculator
 from position_manager import get_position_manager
@@ -64,6 +93,24 @@ def signal_handler(sig, frame):
     stop_event.set()
     sys.exit(0)
 
+
+def _check_stop_signal():
+    """检查 launcher 写入的停止信号文件，实现跨控制台的优雅关闭。
+
+    Windows 下 CREATE_NEW_CONSOLE 创建的进程有独立控制台，
+    GenerateConsoleCtrlEvent 无法送达 Ctrl+C。
+    launcher 的 cmd_stop 在发送 Ctrl+C 的同时，也会写入
+    data_<id>/stop_signal 文件。主循环检测到该文件即触发优雅退出。
+    """
+    signal_path = os.path.join(config.DATA_DIR, "stop_signal")
+    if os.path.exists(signal_path):
+        logger.info("检测到停止信号文件，触发优雅退出")
+        try:
+            os.remove(signal_path)
+        except Exception:
+            pass
+        stop_event.set()
+
 def load_persisted_configs():
     """从数据库加载持久化配置"""
     logger.info("加载持久化配置")
@@ -98,6 +145,7 @@ def _start_xtquant_manager_server():
             host="127.0.0.1",
             port=8888,
             api_token=getattr(config, "XTQUANT_MANAGER_TOKEN", ""),
+            rate_limit=getattr(config, "XTQUANT_MANAGER_RATE_LIMIT", 600),
         )
         server = XtQuantServer(config=srv_cfg)
         server.start(blocking=False)
@@ -152,6 +200,12 @@ def init_system():
     trading_executor = get_trading_executor()
     trading_strategy = get_trading_strategy()
 
+    # Fix: web_server.py 模块加载时（import 阶段）触发 DataManager 单例创建，
+    # 但此时 XtQuantManager HTTP 服务尚未启动，导致 xtdata 初始化失败（self.xt=None）。
+    # 在 HTTP 服务启动后，调用 reinit_xtquant() 补充初始化。
+    if getattr(config, "ENABLE_XTQUANT_MANAGER", False):
+        data_manager.reinit_xtquant()
+
     # 预热股票名称缓存，避免首次交易时触发 baostock 导致 xtdata 断连
     data_manager.warm_stock_name_cache()
 
@@ -194,12 +248,18 @@ def heartbeat_logger():
                 asset_str = f"获取失败:{str(e)[:20]}"
 
             # 输出心跳日志
+            try:
+                market_health_str = get_data_manager().format_market_health_summary()
+            except Exception as e:
+                market_health_str = f"行情健康: 获取失败:{str(e)[:20]}"
+
             logger.info("=" * 50)
             logger.info(f"💓 系统心跳 - 运行时长:{uptime_str}")
             logger.info(f"   模式:{'模拟' if config.ENABLE_SIMULATION_MODE else '实盘'} | "
                        f"自动交易:{'开启' if config.ENABLE_AUTO_TRADING else '关闭'} | "
                        f"网格交易:{'开启' if config.ENABLE_GRID_TRADING else '关闭'}")
             logger.info(f"   持仓数量:{position_count} | {asset_str}")
+            logger.info(f"   {market_health_str}")
             logger.info("=" * 50)
 
         except Exception as e:
@@ -274,6 +334,15 @@ def start_log_cleanup_thread():
         log_thread.daemon = True
         log_thread.start()
         threads.append(("log_thread", lambda: None))  # 没有停止函数，依赖于daemon=True
+
+def start_database_maintenance_thread():
+    """启动数据库维护线程"""
+    if config.ENABLE_DB_MAINTENANCE:
+        logger.info("启动数据库维护线程")
+        db_maintenance_thread = threading.Thread(target=schedule_database_maintenance)
+        db_maintenance_thread.daemon = True
+        db_maintenance_thread.start()
+        threads.append(("db_maintenance_thread", lambda: None))
 
 def start_web_server_thread(position_manager):
     """启动Web服务器线程
@@ -440,6 +509,7 @@ def main():
         start_position_thread(position_manager)
         start_strategy_thread(trading_strategy)
         start_log_cleanup_thread()
+        start_database_maintenance_thread()
 
         # ============ 新增: 启动盘前同步调度器 ============
         from premarket_sync import start_premarket_sync_scheduler
@@ -495,12 +565,16 @@ def main():
                 logger.warning(f"⚠️ 卖出监控器失败:{str(e)[:30]}")
                 logger.info("系统继续运行")
 
-        # 最后启动Web服务器，传入已初始化的position_manager
-        start_web_server_thread(position_manager)
+        # 启动Web服务器（web2.0 模式下跳过 Flask，用 xtquant_manager 托管界面）
+        if not os.environ.get("QMT_NO_FLASK"):
+            start_web_server_thread(position_manager)
+        else:
+            logger.info("web2.0 模式 — 跳过 Flask Web 服务器（由 xtquant_manager 托管）")
 
         # 等待退出信号
         logger.info("✅ 系统启动完成")
         while not stop_event.is_set():
+            _check_stop_signal()
             time.sleep(1)
 
     except Exception as e:

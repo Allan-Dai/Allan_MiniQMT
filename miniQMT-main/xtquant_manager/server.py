@@ -7,7 +7,9 @@ FastAPI 路由定义
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 
 from .exceptions import (
@@ -65,13 +67,65 @@ def create_app(security_config: Optional[SecurityConfig] = None) -> FastAPI:
     from .security import create_security_middleware
     app.add_middleware(create_security_middleware(security_config))
 
+    # CORS：允许本地 HTML 文件（file://）和常用本地开发地址访问
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     # 将安全配置存入 app.state，供路由访问
     app.state.security_config = security_config
 
     # 注册路由
     _register_routes(app, security_config)
 
+    # —— 托管 web2.0 前端（如果已构建） ——
+    _mount_web_ui(app)
+
     return app
+
+
+def _mount_web_ui(app: FastAPI) -> None:
+    """将 web2.0/dist/ 挂载为静态站点（如果存在）。
+    用户启动 xtquant_manager 后可直接访问 http://host:port/ 使用 web2.0 界面。
+    """
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    dist_dir = root / "web2.0" / "dist"
+
+    if not dist_dir.is_dir() or not (dist_dir / "index.html").exists():
+        logger.info("web2.0 未构建，跳过 web2.0 界面。运行 cd web2.0 && npm run build 后可用。")
+        return
+
+    # 挂载静态资源（JS/CSS/图标等）
+    assets_dir = dist_dir / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="web2_assets")
+
+    # SPA fallback: 非 /api/ 路径返回 index.html（API 路由已先注册，优先级更高）
+    import re
+    _api_pattern = re.compile(r"^/api/")
+    _asset_pattern = re.compile(r"^/assets/")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        if _api_pattern.match(f"/{full_path}"):
+            raise HTTPException(status_code=404, detail="Not found")
+        if _asset_pattern.match(f"/{full_path}"):
+            raise HTTPException(status_code=404, detail="Not found")
+        file_path = dist_dir / full_path
+        if file_path.is_file():
+            return FileResponse(str(file_path))
+        return FileResponse(str(dist_dir / "index.html"))
+
+    # 首页
+    @app.get("/")
+    async def serve_index():
+        return FileResponse(str(dist_dir / "index.html"))
+
+    logger.info("web2.0 界面已就绪 — 访问根路径即可使用")
 
 
 def _make_token_verifier(security_config: SecurityConfig):
@@ -456,3 +510,523 @@ def _register_routes(app: FastAPI, security_config: SecurityConfig):
             return ApiResponse(success=True, data=m)
         except AccountNotFoundError:
             raise HTTPException(status_code=404, detail=f"账号不存在: {account_id}")
+
+    # ------------------------------------------------------------------
+    # 止盈止损策略 API
+    # ------------------------------------------------------------------
+
+    @app.get(
+        "/api/v1/stop-profit/status",
+        response_model=ApiResponse,
+        tags=["止盈止损"],
+    )
+    async def stop_profit_status(request: Request):
+        """获取止盈止损监控状态和各持仓跟踪数据"""
+        mon = getattr(request.app.state, "stop_profit_monitor", None)
+        if mon is None:
+            return ApiResponse(success=True, data={"running": False, "reason": "未启用"})
+        cfg = mon.get_config()
+        return ApiResponse(success=True, data={
+            "running": mon.is_running,
+            "config": {
+                "enabled": cfg.enabled,
+                "stop_loss_ratio": cfg.stop_loss_ratio,
+                "initial_take_profit_ratio": cfg.initial_take_profit_ratio,
+                "initial_take_profit_pullback_ratio": cfg.initial_take_profit_pullback_ratio,
+                "initial_take_profit_sell_ratio": cfg.initial_take_profit_sell_ratio,
+                "monitor_interval": cfg.monitor_interval,
+                "signal_dedup_seconds": cfg.signal_dedup_seconds,
+            },
+            "positions": mon.get_states(),
+        })
+
+    @app.post(
+        "/api/v1/stop-profit/config",
+        response_model=ApiResponse,
+        tags=["止盈止损"],
+    )
+    async def stop_profit_config(request: Request):
+        """更新止盈止损配置（JSON body）"""
+        mon = getattr(request.app.state, "stop_profit_monitor", None)
+        if mon is None:
+            raise HTTPException(status_code=400, detail="止盈止损监控未启动")
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        cfg = mon.get_config()
+        if "enabled" in body:
+            cfg.enabled = bool(body["enabled"])
+        if "stop_loss_ratio" in body:
+            cfg.stop_loss_ratio = float(body["stop_loss_ratio"])
+        if "initial_take_profit_ratio" in body:
+            cfg.initial_take_profit_ratio = float(body["initial_take_profit_ratio"])
+        if "initial_take_profit_pullback_ratio" in body:
+            cfg.initial_take_profit_pullback_ratio = float(body["initial_take_profit_pullback_ratio"])
+        if "initial_take_profit_sell_ratio" in body:
+            cfg.initial_take_profit_sell_ratio = float(body["initial_take_profit_sell_ratio"])
+        if "monitor_interval" in body:
+            cfg.monitor_interval = float(body["monitor_interval"])
+        mon.update_config(cfg)
+        return ApiResponse(success=True, data={"message": "配置已更新"})
+
+    @app.post(
+        "/api/v1/stop-profit/toggle",
+        response_model=ApiResponse,
+        tags=["止盈止损"],
+    )
+    async def stop_profit_toggle(request: Request, enabled: bool = True):
+        """启用/停止止盈止损监控"""
+        mon = getattr(request.app.state, "stop_profit_monitor", None)
+        if mon is None:
+            raise HTTPException(status_code=400, detail="止盈止损监控未启动，请在配置中设置 enable_stop_profit=true 并重启服务。")
+        cfg = mon.get_config()
+        cfg.enabled = enabled
+        mon.update_config(cfg)
+        return ApiResponse(success=True, data={"enabled": enabled, "message": "已启用" if enabled else "已暂停"})
+
+    # ------------------------------------------------------------------
+    # Flask web1.0 兼容端点 — 让 web2.0 前端在 xtquant_manager 上也能运行
+    # ------------------------------------------------------------------
+
+    def _first_account_id():
+        """获取第一个已注册账号 ID，用于兼容端点。"""
+        ids = _get_manager().list_accounts()
+        return ids[0] if ids else None
+
+    def _get_request_account_id(request: Request):
+        """从 X-Account-Id 请求头获取目标账号，fallback 到第一个注册账号。"""
+        header_id = (request.headers.get("X-Account-Id") or "").strip()
+        if header_id:
+            ids = _get_manager().list_accounts()
+            if header_id in ids:
+                return header_id
+        return _first_account_id()
+
+    def _load_sqlite_enrichment(aid: str) -> dict:
+        """从 data_<aid>/trading.db 读取持久化的持仓元数据。
+
+        position_manager 每 15 秒将内存数据同步到 SQLite，包含：
+        stock_name / open_date / stop_loss_price / profit_triggered / highest_price
+        等精确的策略计算值，远优于手工估算。
+
+        Returns:
+            {stock_code: {stock_name, open_date, stop_loss_price,
+                          profit_triggered, highest_price}}，读取失败返回 {}。
+        """
+        import sqlite3
+        import os as _os
+        db_path = _os.path.join(_os.path.dirname(__file__), "..", f"data_{aid}", "trading.db")
+        db_path = _os.path.normpath(db_path)
+        if not _os.path.exists(db_path):
+            return {}
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT stock_code, stock_name, open_date, stop_loss_price, "
+                "profit_triggered, highest_price FROM positions"
+            ).fetchall()
+            conn.close()
+            result = {}
+            for r in rows:
+                result[r["stock_code"]] = {
+                    "stock_name": r["stock_name"] or "",
+                    "open_date": r["open_date"] or "",
+                    "stop_loss_price": r["stop_loss_price"] or 0,
+                    "profit_triggered": bool(r["profit_triggered"]),
+                    "highest_price": r["highest_price"] or 0,
+                }
+            return result
+        except Exception:
+            return {}
+
+    def _normalize_stock_code(code: str) -> str:
+        """股票代码归一化为 6 位裸代码，用于跨接口匹配 003025 / 003025.SZ。"""
+        return str(code or "").strip().split(".")[0]
+
+    def _load_grid_sessions_from_sqlite(aid: str) -> list:
+        """从 data_<aid>/trading.db 读取网格会话，供 Flask 兼容端点使用。"""
+        import sqlite3
+        import os as _os
+        db_path = _os.path.join(_os.path.dirname(__file__), "..", f"data_{aid}", "trading.db")
+        db_path = _os.path.normpath(db_path)
+        if not _os.path.exists(db_path):
+            return []
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM grid_trading_sessions "
+                "ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, "
+                "start_time DESC, id DESC"
+            ).fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+        except Exception:
+            return []
+
+    def _active_grid_codes(aid: str) -> set:
+        """读取活跃网格股票集合，使用裸代码避免后缀差异导致误判。"""
+        return {
+            _normalize_stock_code(s.get("stock_code"))
+            for s in _load_grid_sessions_from_sqlite(aid)
+            if str(s.get("status") or "").lower() in ("active", "stopping")
+        }
+
+    def _grid_session_to_compat(row: dict) -> dict:
+        """SQLite 网格会话 → web2.0 兼容字段。"""
+        total_buy = float(row.get("total_buy_amount") or 0)
+        total_sell = float(row.get("total_sell_amount") or 0)
+        grid_profit = total_sell - total_buy
+        denominator = float(row.get("max_investment") or 0)
+        profit_ratio = grid_profit / denominator if denominator else 0
+        return {
+            "session_id": row.get("id"),
+            "stock_code": row.get("stock_code") or "",
+            "status": row.get("status") or "",
+            "enabled": bool(row.get("enabled", 1)),
+            "center_price": row.get("center_price") or 0,
+            "current_center_price": row.get("current_center_price") or row.get("center_price") or 0,
+            "trade_count": row.get("trade_count") or 0,
+            "buy_count": row.get("buy_count") or 0,
+            "sell_count": row.get("sell_count") or 0,
+            "profit_ratio": profit_ratio,
+            "grid_profit": grid_profit,
+            "pnl_snapshot": {
+                "profit_ratio": profit_ratio,
+                "total_pnl": grid_profit,
+                "realized_pnl": grid_profit,
+                "unrealized_pnl": 0,
+                "method": "cash_flow_legacy",
+                "is_degraded": True,
+                "denominator": denominator,
+                "denominator_type": "max_investment",
+            },
+            "current_investment": row.get("current_investment") or 0,
+            "max_investment": row.get("max_investment") or 0,
+            "deviation_ratio": 0,
+            "start_time": row.get("start_time"),
+            "end_time": row.get("end_time"),
+            "stop_time": row.get("stop_time"),
+            "stop_reason": row.get("stop_reason"),
+        }
+
+    def _load_trade_records_from_sqlite(aid: str) -> list:
+        """从 data_<aid>/trading.db 的 trade_records 表读取交易记录。
+
+        与 web1.0 同源：position_manager/trading_executor 将买卖记录持久化到
+        此表，含 名称/时间/策略/买卖历史，远优于 QMT 当日成交（缺名称/时间/策略、
+        且只有当日）。按时间倒序返回，读取失败返回 []。
+        """
+        import sqlite3
+        import os as _os
+        db_path = _os.path.join(_os.path.dirname(__file__), "..", f"data_{aid}", "trading.db")
+        db_path = _os.path.normpath(db_path)
+        if not _os.path.exists(db_path):
+            return []
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT stock_code, stock_name, trade_time, trade_type, price, "
+                "volume, trade_id, strategy FROM trade_records ORDER BY trade_time DESC"
+            ).fetchall()
+            conn.close()
+            result = []
+            for r in rows:
+                result.append({
+                    "stock_code": r["stock_code"] or "",
+                    "stock_name": r["stock_name"] or "",
+                    "trade_type": r["trade_type"] or "",
+                    "price": r["price"] or 0,
+                    "volume": r["volume"] or 0,
+                    "trade_time": r["trade_time"] or "--",
+                    "trade_id": str(r["trade_id"] or ""),
+                    "strategy": r["strategy"] or "",
+                })
+            return result
+        except Exception:
+            return []
+
+    def _to_xt_code(code: str) -> str:
+        """6 位证券代码补全市场后缀（xtdata get_full_tick 要求带后缀）。
+        持仓接口返回的是 6 位裸代码，需按 A 股规则映射：
+        6/900→.SH（上交所），0/3/200→.SZ（深交所）。已带后缀则原样返回。"""
+        if not code or "." in code:
+            return code
+        if code.startswith(("6", "900")):
+            return f"{code}.SH"
+        if code.startswith(("0", "3", "200")):
+            return f"{code}.SZ"
+        return code
+
+    def _enrich_positions_with_tick(positions: list, manager) -> None:
+        """批量获取全推行情，为每个持仓 dict 注入 _tick_change_pct。
+        失败时字段为 0，不抛异常。"""
+        # 持仓代码是 6 位裸码，get_full_tick 需带后缀，建立 裸码→后缀码 映射
+        bare_to_xt = {p.get("证券代码", ""): _to_xt_code(p.get("证券代码", ""))
+                      for p in positions if p.get("证券代码")}
+        if not bare_to_xt:
+            return
+        tick = {}
+        try:
+            accounts = manager.list_accounts()
+            if accounts:
+                tick = manager.get_full_tick(accounts[0], list(bare_to_xt.values())) or {}
+        except Exception:
+            pass
+        for p in positions:
+            code = p.get("证券代码", "")
+            q = tick.get(bare_to_xt.get(code, code), {})
+            lp = q.get("lastPrice", 0) or 0
+            lc = q.get("lastClose", 0) or 0
+            p["_tick_change_pct"] = round(100 * (lp - lc) / lc, 2) if lc else 0
+
+    def _map_position_to_flask(p: dict) -> dict:
+        """xtquant 中文字段持仓 + SQLite 持久化元数据 → Flask 英文字段。
+
+        QMT 提供实时交易字段（量/价/市值），SQLite 提供策略元数据
+        （名称/建仓日期/止损价/止盈触发/最高价），通过 p 中的 _sqlite_* 键合并。"""
+        vol = p.get("股票余额", 0) or 0
+        cost = p.get("成本价", 0) or 0
+        mv = p.get("市值", 0) or 0
+        cur = p.get("市价")
+        if not cur and vol:
+            cur = mv / vol
+        cur = cur or 0
+        profit_ratio = round(100 * (cur - cost) / cost, 2) if cost else 0  # 百分比，与 Flask 对齐
+        code = p.get("证券代码", "")
+
+        # SQLite 持久化元数据（由 _enrich_positions_from_sqlite 注入）
+        name     = p.get("_sqlite_name") or ""
+        open_dt  = p.get("_sqlite_open_date") or ""
+        sl_price = p.get("_sqlite_stop_loss_price")
+        trig     = p.get("_sqlite_profit_triggered", False)
+        high_p   = p.get("_sqlite_highest_price")
+
+        if sl_price is None or sl_price == 0:
+            sl_price = round(cost * 0.925, 2)  # fallback: 与 STOP_LOSS_RATIO=-0.075 对齐
+        if high_p is None or high_p == 0:
+            high_p = cur
+
+        return {
+            "stock_code": code,
+            "stock_name": name or code,
+            "volume": vol,
+            "available": p.get("可用余额", 0) or 0,
+            "cost_price": cost,
+            "current_price": cur,
+            "market_value": mv,
+            "profit_ratio": profit_ratio,
+            "profit_amount": (cur - cost) * vol,
+            "profit_triggered": trig,
+            "highest_price": high_p,
+            "stop_loss_price": sl_price,
+            "open_date": (open_dt or "")[:10] or "--",
+            "change_percentage": p.get("_tick_change_pct", 0),
+            "grid_session_active": bool(p.get("_grid_session_active", False)),
+        }
+
+    def _map_trade_to_flask(t: dict) -> dict:
+        """xtquant 中文字段成交/委托 → Flask 英文字段交易记录。"""
+        # 委托类型: 23=买入, 24=卖出（其余按奇偶兜底）
+        order_type = t.get("委托类型", 0) or 0
+        trade_type = "BUY" if order_type == 23 else ("SELL" if order_type == 24 else ("BUY" if order_type % 2 == 1 else "SELL"))
+        return {
+            "stock_code": t.get("证券代码", ""),
+            "stock_name": t.get("证券名称") or "",
+            "trade_type": trade_type,
+            "price": t.get("成交价格") or t.get("委托价格") or 0,
+            "volume": t.get("成交数量") or t.get("委托数量") or 0,
+            "trade_time": t.get("成交时间") or "--",
+            "trade_id": str(t.get("成交编号") or t.get("订单编号") or ""),
+            "strategy": "manual",
+        }
+
+    @app.get("/api/status", tags=["兼容"])
+    async def flask_status(request: Request):
+        """Flask 兼容: /api/status → 返回指定账号的状态（顶层字段格式）"""
+        aid = _get_request_account_id(request)
+        if not aid:
+            return JSONResponse({"status": "error", "error": "无已注册账号"})
+        try:
+            asset = _get_manager().query_asset(aid)
+            return JSONResponse({
+                "status": "success",
+                "isMonitoring": True,
+                "account": {
+                    "id": aid,
+                    "availableBalance": asset.get("可用金额", 0),
+                    "maxHoldingValue": asset.get("持仓市值", 0),
+                    "totalAssets": asset.get("总资产", 0),
+                    "timestamp": "",
+                },
+                "settings": {
+                    "isMonitoring": True,
+                    "enableAutoTrading": True,
+                    "positionMonitorRunning": True,
+                    "allowBuy": True,
+                    "allowSell": True,
+                    "simulationMode": False,
+                },
+            })
+        except Exception:
+            raise HTTPException(status_code=404, detail=f"账号不存在: {aid}")
+
+    @app.get("/api/positions", tags=["兼容"])
+    async def flask_positions(request: Request, version: int = -1):
+        """Flask 兼容: /api/positions（字段映射为前端英文格式，顶层字段格式）"""
+        aid = _get_request_account_id(request)
+        if not aid:
+            return JSONResponse({"status": "error", "error": "无已注册账号"})
+        try:
+            raw = _get_manager().query_positions(aid)
+            sqlite = _load_sqlite_enrichment(aid)
+            active_grid_codes = _active_grid_codes(aid)
+            # 将 SQLite 持久化字段注入到 QMT 持仓 dict 中
+            for p in raw:
+                code = p.get("证券代码", "")
+                enr = sqlite.get(code, {})
+                p["_sqlite_name"]              = enr.get("stock_name", "")
+                p["_sqlite_open_date"]         = enr.get("open_date", "")
+                p["_sqlite_stop_loss_price"]   = enr.get("stop_loss_price", 0)
+                p["_sqlite_profit_triggered"]  = enr.get("profit_triggered", False)
+                p["_sqlite_highest_price"]     = enr.get("highest_price", 0)
+                p["_grid_session_active"]      = _normalize_stock_code(code) in active_grid_codes
+            _enrich_positions_with_tick(raw, _get_manager())
+            positions = [_map_position_to_flask(p) for p in raw]
+            total_mv = sum(p["market_value"] for p in positions)
+            total_profit = sum(p["profit_amount"] for p in positions)
+            total_cost = sum(p["cost_price"] * p["volume"] for p in positions)
+            metrics = {
+                "total_market_value": total_mv,
+                "total_profit": total_profit,
+                "total_profit_ratio": (total_profit / total_cost) if total_cost else 0,
+                "position_count": len(positions),
+                "stock_count": len(positions),
+            }
+            return JSONResponse({
+                "status": "success",
+                "data": {
+                    "positions": positions,
+                    "metrics": metrics,
+                    "positions_all": positions,
+                },
+                "data_version": 0,
+                "no_change": False,
+            })
+        except Exception:
+            return JSONResponse({
+                "status": "success",
+                "data": {"positions": [], "metrics": {}, "positions_all": []},
+                "data_version": 0,
+                "no_change": False,
+            })
+
+    @app.get("/api/positions-all", tags=["兼容"])
+    async def flask_positions_all(request: Request, version: int = 0):
+        """Flask 兼容: /api/positions-all"""
+        aid = _get_request_account_id(request)
+        if not aid:
+            return JSONResponse({"status": "success", "data": [], "data_version": 0, "no_change": False})
+        try:
+            raw = _get_manager().query_positions(aid)
+            sqlite = _load_sqlite_enrichment(aid)
+            active_grid_codes = _active_grid_codes(aid)
+            for p in raw:
+                code = p.get("证券代码", "")
+                enr = sqlite.get(code, {})
+                p["_sqlite_name"]              = enr.get("stock_name", "")
+                p["_sqlite_open_date"]         = enr.get("open_date", "")
+                p["_sqlite_stop_loss_price"]   = enr.get("stop_loss_price", 0)
+                p["_sqlite_profit_triggered"]  = enr.get("profit_triggered", False)
+                p["_sqlite_highest_price"]     = enr.get("highest_price", 0)
+                p["_grid_session_active"]      = _normalize_stock_code(code) in active_grid_codes
+            _enrich_positions_with_tick(raw, _get_manager())
+            positions = [_map_position_to_flask(p) for p in raw]
+            return JSONResponse({
+                "status": "success",
+                "data": positions,
+                "data_version": 0,
+                "no_change": False,
+            })
+        except Exception:
+            return JSONResponse({"status": "success", "data": [], "data_version": 0, "no_change": False})
+
+    @app.get("/api/accounts", tags=["兼容"])
+    async def flask_list_accounts():
+        """Flask 兼容: /api/accounts —— 无 token 列出账号 ID 列表。
+
+        与 v1 /api/v1/accounts 相同数据，但不受 Depends(verify_token) 保护，
+        与其他 Flask 兼容只读端点(positions/status 等)的安全级别一致。
+        互联网只读用户(没有 token)需要此端点才能拿到正确的账号列表，
+        否则前端只能用占位 ID，导致 X-Account-Id 始终匹配不上、
+        网关 fallback 总返回第一个账号的数据。
+        """
+        accounts = _get_manager().list_accounts()
+        return JSONResponse({"status": "success", "success": True, "data": {"accounts": accounts}})
+
+    @app.get("/api/connection/status", tags=["兼容"])
+    async def flask_connection_status(request: Request):
+        """Flask 兼容: /api/connection/status（connected 为顶层字段）"""
+        aid = _get_request_account_id(request)
+        if not aid:
+            return JSONResponse({"status": "success", "connected": False, "timestamp": ""})
+        state = _get_manager().get_account_state(aid)
+        return JSONResponse({
+            "status": "success",
+            "connected": state.get("connected", False),
+            "timestamp": "",
+        })
+
+    @app.get("/api/config", tags=["兼容"])
+    async def flask_config():
+        """Flask 兼容: /api/config → 返回默认配置（data/ranges 为顶层字段）"""
+        return JSONResponse({
+            "status": "success",
+            "data": {
+                "singleBuyAmount": 35000,
+                "firstProfitSell": 5.0, "firstProfitSellEnabled": True,
+                "stockGainSellPencent": 60.0, "firstProfitSellPencent": True,
+                "allowBuy": True, "allowSell": True,
+                "stopLossBuy": 5.0, "stopLossBuyEnabled": True,
+                "stockStopLoss": 7.0, "StopLossEnabled": True,
+                "singleStockMaxPosition": 70000, "totalMaxPosition": 400000,
+                "globalAllowBuySell": True, "simulationMode": False,
+            },
+            "ranges": {},
+        })
+
+    @app.get("/api/trade-records", tags=["兼容"])
+    async def flask_trade_records(request: Request):
+        """Flask 兼容: /api/trade-records（与 web1.0 同源：优先读 SQLite trade_records）"""
+        aid = _get_request_account_id(request)
+        if not aid:
+            return JSONResponse({"status": "success", "data": []})
+        # 优先从 SQLite trade_records 读取（含 名称/时间/策略/买卖历史，与 web1.0 一致）
+        records = _load_trade_records_from_sqlite(aid)
+        if records:
+            return JSONResponse({"status": "success", "data": records})
+        # 降级：SQLite 无记录时回退 QMT 当日成交/委托（缺名称/时间/策略）
+        trades = _get_manager().query_trades(aid)
+        if not trades:
+            trades = _get_manager().query_orders(aid)
+        mapped = [_map_trade_to_flask(t) for t in (trades or [])]
+        return JSONResponse({"status": "success", "data": mapped})
+
+    @app.get("/api/grid/sessions", tags=["兼容"])
+    async def flask_grid_sessions(request: Request):
+        """Flask 兼容: /api/grid/sessions（网关模式下从 SQLite 返回会话状态）。"""
+        aid = _get_request_account_id(request)
+        if not aid:
+            return JSONResponse({"status": "success", "success": True, "sessions": [], "total": 0})
+        sessions = [_grid_session_to_compat(row) for row in _load_grid_sessions_from_sqlite(aid)]
+        return JSONResponse({
+            "status": "success",
+            "success": True,
+            "sessions": sessions,
+            "total": len(sessions),
+        })
